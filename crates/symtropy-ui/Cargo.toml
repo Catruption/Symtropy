@@ -1,0 +1,20 @@
+[package]
+name = "symtropy-ui"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+eframe = { workspace = true }
+egui = { workspace = true }
+image = { workspace = true }
+webp-animation = { workspace = true }
+alhazen-core = { workspace = true }
+x11rb = { workspace = true }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+[profile.dev.package."*"]
+opt-level = 3
+
+[profile.dev]
+opt-level = 1

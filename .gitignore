@@ -1,0 +1,7 @@
+/target/
+**/target/
+database/References
+database/References_backup
+*.tmp
+*.tmp.png
+.DS_Store

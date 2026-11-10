@@ -1,0 +1,28 @@
+{
+    "name": "Steel",
+    "image": "squares.webp",
+    "inset": 20,
+    "topInsetMultiplier": 2,
+    "titleBar": {
+        "fontSize": "20px",
+        "color": "white",
+        "position": "top-left",
+        "offsetX": 70,
+        "offsetY": 0
+    },
+    "icon": {
+        "enabled": true,
+        "position": "top-left",
+        "offsetX": 520,
+        "offsetY": 480,
+        "size": 64
+    },
+    "controls": {
+        "position": "top-right",
+        "offsetX": -500,
+        "offsetY": 470,
+        "size": 80,
+        "overlap": 25,
+        "enabled": true
+    }
+}
