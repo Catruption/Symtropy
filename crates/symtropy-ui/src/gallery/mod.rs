@@ -13,22 +13,23 @@ use crate::filter::FilterPass;
 pub mod hierarchy;
 pub mod layout;
 pub mod query;
+pub mod sidecar;
 pub mod ui;
 pub mod workers;
 
 pub use hierarchy::Hierarchy;
 pub use query::Query;
-pub use workers::Msg;
+pub use sidecar::Sidecar;
+pub use workers::{Msg, ScanMsg};
 
-pub const BASE_MAX: u32 = 1024; // Or 2048 if you have a 4K monitor and want it perfectly sharp zoomed in
-pub const MAX_UPLOADS_PER_FRAME: usize = 12;
+pub const MAX_UPLOADS_PER_FRAME: usize = 24;
 pub const MAX_TEXTURES: usize = 400;
 pub const MARGIN: f32 = 0.0;
 pub const TARGET_ROW_HEIGHT: f32 = 200.0;
 pub const SMALL_MAX: f32 = 48.0;
-pub const SCAN_TIMEOUT_SECS: u64 = 60;
+pub const SCAN_TIMEOUT_SECS: u64 = 1800;
 
-#[derive(Clone, Debug, Default)]
+#[derive(Clone, Debug, Default, serde::Serialize, serde::Deserialize)]
 pub struct BorderColors {
     pub top: Option<[u8; 4]>,
     pub bottom: Option<[u8; 4]>,
@@ -42,7 +43,7 @@ impl BorderColors {
     }
 }
 
-#[derive(Clone, Copy, Debug, Default, PartialEq)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct Margins {
     pub top: u32,
     pub bottom: u32,
@@ -70,16 +71,15 @@ pub struct GalleryItem {
     pub margins: Margins,
     pub rating: u8,
     pub tags: HashSet<String>,
+    pub sidecar: Sidecar,
 }
 
-/// A renderable tag tree node for the sidebar. Built from `Hierarchy`.
 #[derive(Clone, Debug)]
 pub struct TagNode {
     pub name: String,
     pub children: Vec<TagNode>,
 }
 
-/// Convert the parsed `Hierarchy` into a `TagNode` tree that the sidebar can render.
 pub fn tree_from_hierarchy(h: &Hierarchy) -> TagNode {
     fn build(h: &Hierarchy, name: &str) -> TagNode {
         let children = h
@@ -140,7 +140,7 @@ pub struct GalleryState {
     pub items: Vec<GalleryItem>,
 
     pub(crate) scanning: bool,
-    pub(crate) scan_rx: Receiver<Vec<GalleryItem>>,
+    pub(crate) scan_rx: Receiver<ScanMsg>,
     pub(crate) scan_progress: Arc<AtomicUsize>,
     pub(crate) scan_started_at: Option<Instant>,
 
@@ -182,22 +182,14 @@ impl GalleryState {
         let hierarchy = match std::fs::read_to_string(&tags_path) {
             Ok(text) => {
                 let h = Hierarchy::parse(&text);
-                eprintln!(
-                    "gallery: loaded {} tags from {}",
-                    h.len(),
-                          tags_path.display()
-                );
+                eprintln!("gallery: loaded {} tags from {}", h.len(), tags_path.display());
                 h
             }
             Err(_) => {
-                eprintln!(
-                    "gallery: no tag file at {} — tag hierarchy disabled",
-                    tags_path.display()
-                );
+                eprintln!("gallery: no tag file at {} — tag hierarchy disabled", tags_path.display());
                 Hierarchy::default()
             }
         };
-        // Build the renderable tree from the parsed hierarchy, not a mock.
         let tag_tree = tree_from_hierarchy(&hierarchy);
 
         let cache = workers::cache_dir();
@@ -208,15 +200,9 @@ impl GalleryState {
             let (dir, index_path, progress, ctx) =
             (dir.to_path_buf(), cache.join("index.tsv"), progress.clone(), ctx.clone());
             std::thread::spawn(move || {
-                let items = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                    workers::scan_worker(dir, index_path, progress)
-                }))
-                .unwrap_or_else(|_| {
-                    eprintln!("gallery: scan worker panicked; returning empty list");
-                    Vec::new()
-                });
-                let _ = scan_tx.send(items);
-                ctx.request_repaint();
+                let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    workers::scan_worker(dir, index_path, progress, scan_tx, ctx);
+                }));
             });
         }
 
@@ -224,7 +210,6 @@ impl GalleryState {
             queue: std::sync::Mutex::new(Vec::new()),
                               cv: std::sync::Condvar::new(),
                               wanted: std::sync::Mutex::new(HashMap::new()),
-                              cache_dir: cache,
         });
         let (tx, result_rx) = channel();
         let n = std::thread::available_parallelism()
@@ -272,14 +257,38 @@ impl GalleryState {
         if self.scanning {
             if let Some(start) = self.scan_started_at {
                 if start.elapsed().as_secs() >= SCAN_TIMEOUT_SECS {
-                    eprintln!("gallery: scan timed out after {}s, forcing stop", SCAN_TIMEOUT_SECS);
+                    eprintln!(
+                        "gallery: scan still running after {}s — background will finish; items keep arriving",
+                        SCAN_TIMEOUT_SECS
+                    );
                     self.scanning = false;
                 }
             }
         }
-        if let Ok(items) = self.scan_rx.try_recv() {
-            self.items = items;
-            self.scanning = false;
+
+        loop {
+            match self.scan_rx.try_recv() {
+                Ok(ScanMsg::Batch(items)) => {
+                    self.items.extend(items);
+                }
+                Ok(ScanMsg::MarginUpdate { path, margins, colors }) => {
+                    if let Some(it) = self.items.iter_mut().find(|i| i.path == path) {
+                        it.margins = margins;
+                        it.border_colors = colors;
+                    }
+                }
+                Ok(ScanMsg::Done) => {
+                    self.scanning = false;
+                    self.items.sort_by(|a, b| {
+                        b.is_folder.cmp(&a.is_folder)
+                        .then_with(|| (b.width * b.height).partial_cmp(&(a.width * a.height)).unwrap_or(std::cmp::Ordering::Equal))
+                        .then_with(|| a.title.to_lowercase().cmp(&b.title.to_lowercase()))
+                    });
+                    self.layout_cache = None;
+                    ctx.request_repaint();
+                }
+                Err(_) => break,
+            }
         }
 
         let mut uploads = 0;

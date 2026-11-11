@@ -1,27 +1,34 @@
 mod app;
 mod filter;
 mod gallery;
+mod file_manager;
+mod sidebar;
 mod theme;
 mod window;
 mod x11;
 
+use app::SymtropyApp;
+
 fn main() -> eframe::Result<()> {
-    // Native Wayland never tells a client where its window is, which the tiling detection in
-    // window/mod.rs needs. Running through XWayland/X11 does, so hide the Wayland display (this
-    // runs before any other thread exists, so mutating the environment is fine).
+    // Force X11/XWayland so our _GTK_FRAME_EXTENTS tiling hack works. winit 0.29 picks native
+    // Wayland whenever WAYLAND_DISPLAY is set (it no longer reads WINIT_UNIX_BACKEND), so hide it.
+    // This must run before anything else touches the environment or spawns a thread.
     if std::env::var_os("DISPLAY").is_some() {
         std::env::remove_var("WAYLAND_DISPLAY");
     }
+
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
-            .with_title("Symtropy")
-            .with_inner_size([1440.0, 960.0])
-            .with_min_inner_size([660.0, 500.0])
-            // The steel frame IS the window chrome, and its texture margin needs
-            // a transparent OS window so the decorations can overhang the plate.
-            .with_decorations(false)
-            .with_transparent(true),
+        .with_title("Symtropy")
+        .with_inner_size([1400.0, 900.0])
+        .with_min_inner_size([800.0, 400.0])
+        .with_decorations(false)
+        .with_transparent(true),
         ..Default::default()
     };
-    eframe::run_native("Symtropy", options, Box::new(|cc| Box::new(app::SymtropyApp::new(cc))))
+    eframe::run_native(
+        "Symtropy",
+        options,
+        Box::new(|cc| Box::new(SymtropyApp::new(cc))),
+    )
 }

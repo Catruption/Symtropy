@@ -40,10 +40,17 @@ impl GalleryState {
     pub fn show(&mut self, ui: &mut Ui, theme: &Theme) {
         self.poll(ui.ctx());
 
-        if self.scanning {
+        if self.scanning && self.items.is_empty() {
             ui.add_space(24.0);
             ui.vertical_centered(|ui| {
-                ui.label(format!("Scanning… {} files", self.scan_progress.load(std::sync::atomic::Ordering::Relaxed)));
+                let n = self.scan_progress.load(std::sync::atomic::Ordering::Relaxed);
+                ui.label(format!("Scanning… {} files", n));
+                ui.add_space(8.0);
+                ui.label(
+                    egui::RichText::new("Phase 1: reading headers & sidecars (fast)")
+                    .size(11.0)
+                    .color(Color32::from_rgb(140, 140, 150)),
+                );
             });
             ui.ctx().request_repaint_after(Duration::from_millis(100));
             return;

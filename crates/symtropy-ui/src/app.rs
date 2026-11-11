@@ -1,17 +1,30 @@
 use crate::theme::Theme;
 use crate::x11::X11Window;
-use crate::gallery::{GalleryState, TagNode, Query, frame_from_time};
-use std::collections::{HashMap, HashSet};
+use crate::gallery::{GalleryState, frame_from_time, Sidecar};
+use crate::sidebar::FilterQuery;
+use crate::file_manager::{FileManagerState, ViewMode};
+use std::collections::HashMap;
+use std::path::{Path, PathBuf};
 
 use alhazen_core::{Player, PlayerConfig, Source, VideoFrame, PlayerEvent};
+
+pub enum FmAction {
+    Navigate(PathBuf),
+    OpenSmart(PathBuf),
+    OpenTerminal(PathBuf),
+    Trash(PathBuf),
+}
 
 pub struct SymtropyApp {
     theme: Theme,
     frames: u32,
     x11: Option<X11Window>,
     last_regions: Vec<[i32; 4]>,
-    gallery: GalleryState,
 
+    fm: FileManagerState,
+    gallery: Option<GalleryState>,
+
+    // Viewer state
     viewer_open: bool,
     viewer_cache: HashMap<String, Option<egui::TextureHandle>>,
     viewer_player: Option<Player>,
@@ -23,114 +36,207 @@ pub struct SymtropyApp {
     viewer_show_sidebar: bool,
     viewer_sidebar_width: f32,
     viewer_needs_fit: bool,
+
+    // UI State
+    is_edit_mode: bool,
+    staged_sidecar: Option<Sidecar>,
+    filter_query: FilterQuery,
+    show_places: bool,
 }
 
 impl SymtropyApp {
     pub fn new(cc: &eframe::CreationContext<'_>) -> Self {
-        cc.egui_ctx.options_mut(|opt| {
-            opt.zoom_with_keyboard = false;
-        });
-
-        let theme_path = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-        .join("assets/themes/steel");
-
+        cc.egui_ctx.options_mut(|opt| { opt.zoom_with_keyboard = false; });
+        let theme_path = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("assets/themes/steel");
         let manifest = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
         let workspace_root = manifest.parent().unwrap().parent().unwrap();
         let db_path = workspace_root.join("database/References");
 
-        let gallery = GalleryState::scan_dir(&cc.egui_ctx, &db_path);
+        let mut fm = FileManagerState::new(db_path);
+        fm.view_mode = ViewMode::Gallery;
+        let gallery = Some(GalleryState::scan_dir(&cc.egui_ctx, &fm.current_dir));
 
         Self {
             theme: Theme::load(&cc.egui_ctx, &theme_path),
-            frames: 0,
-            x11: None,
-            last_regions: Vec::new(),
-            gallery,
-            viewer_open: false,
-            viewer_cache: HashMap::new(),
-            viewer_player: None,
-            viewer_loaded_path: None,
-            viewer_zoom: 1.0,
-            viewer_pan: egui::Vec2::ZERO,
-            viewer_anim_frames: Vec::new(),
-            viewer_anim_durations: Vec::new(),
-            viewer_show_sidebar: true,
-            viewer_sidebar_width: 320.0,
-            viewer_needs_fit: false,
-        }
-    }
-}
-
-fn draw_tag_node(ui: &mut egui::Ui, node: &TagNode, selected_tags: &mut HashSet<String>) {
-    if node.name == "Root" {
-        for child in &node.children {
-            draw_tag_node(ui, child, selected_tags);
-        }
-        return;
-    }
-    if !node.children.is_empty() {
-        // Parent: just a collapsible header, no checkbox.
-        egui::CollapsingHeader::new(&node.name).default_open(false).show(ui, |ui| {
-            for child in &node.children {
-                draw_tag_node(ui, child, selected_tags);
-            }
-        });
-    } else {
-        // Leaf: this is an actual tag, so it gets a checkbox.
-        let mut checked = selected_tags.contains(&node.name);
-        if ui.checkbox(&mut checked, &node.name).changed() {
-            if checked { selected_tags.insert(node.name.clone()); }
-            else { selected_tags.remove(&node.name); }
+            frames: 0, x11: None, last_regions: Vec::new(),
+            fm, gallery,
+            viewer_open: false, viewer_cache: HashMap::new(), viewer_player: None,
+            viewer_loaded_path: None, viewer_zoom: 1.0, viewer_pan: egui::Vec2::ZERO,
+            viewer_anim_frames: Vec::new(), viewer_anim_durations: Vec::new(),
+            viewer_show_sidebar: true, viewer_sidebar_width: 500.0, viewer_needs_fit: false,
+            is_edit_mode: false, staged_sidecar: None, filter_query: FilterQuery::default(),
+            show_places: true,
         }
     }
 }
 
 impl eframe::App for SymtropyApp {
-    fn clear_color(&self, _visuals: &egui::Visuals) -> [f32; 4] {
-        [0.0, 0.0, 0.0, 0.0]
-    }
+    fn clear_color(&self, _visuals: &egui::Visuals) -> [f32; 4] { [0.0, 0.0, 0.0, 0.0] }
 
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         let ppp = ctx.pixels_per_point();
         self.theme.sync_scale(ppp);
 
         self.frames += 1;
-        if self.x11.is_none() && self.frames >= 2 && self.frames < 600 {
-            if let Some(x) = X11Window::find() {
-                x.set_frame_extents((crate::window::overhang(&self.theme) * ppp).round() as u32);
-                self.x11 = Some(x);
+        if self.x11.is_none() && self.frames < 600 {
+            if self.frames % 10 == 0 {
+                if let Some(x) = X11Window::find() {
+                    eprintln!("X11: Found window! Applying frame extents.");
+                    x.set_frame_extents((crate::window::overhang(&self.theme) * ppp).round() as u32);
+                    self.x11 = Some(x);
+                } else if self.frames == 590 {
+                    eprintln!("X11: Gave up. Are you running native Wayland?");
+                }
             }
             ctx.request_repaint();
         }
 
+        let mut fm_actions = Vec::new();
+
         let regions = crate::window::show(ctx, &self.theme, "Symtropy", |ui| {
-            self.gallery.show(ui, &self.theme);
+            let max_size = ui.available_size();
+
+            ui.allocate_ui_with_layout(
+                max_size,
+                egui::Layout::top_down(egui::Align::Min),
+                                       |ui| {
+                                           // Top Bar
+                                           ui.horizontal(|ui| {
+                                               if ui.selectable_label(self.show_places, "📁 Places").clicked() {
+                                                   self.show_places = !self.show_places;
+                                               }
+                                               ui.separator();
+
+                                               if ui.button("⬅").clicked() { self.fm.go_back(); self.gallery = None; }
+                                               if ui.button("➡").clicked() { self.fm.go_forward(); self.gallery = None; }
+                                               if ui.button("⬆").clicked() {
+                                                   if let Some(p) = self.fm.current_dir.parent() { self.fm.navigate_to(p.to_path_buf()); self.gallery = None; }
+                                               }
+
+                                               let resp = ui.add(egui::TextEdit::singleline(&mut self.fm.search_query).hint_text("Search...").desired_width(150.0));
+                                               if resp.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter)) { self.fm.search_recursive(); }
+
+                                               ui.separator();
+                                               ui.selectable_value(&mut self.fm.view_mode, ViewMode::List, "☰ List");
+                                               if ui.selectable_value(&mut self.fm.view_mode, ViewMode::Gallery, "🖼️ Gallery").clicked() {
+                                                   if self.gallery.is_none() {
+                                                       self.gallery = Some(GalleryState::scan_dir(ui.ctx(), &self.fm.current_dir));
+                                                   }
+                                               }
+                                               ui.checkbox(&mut self.fm.show_hidden, "Hidden");
+                                           });
+                                           ui.separator();
+
+                                           // Split layout
+                                           ui.horizontal_top(|ui| {
+                                               if self.show_places {
+                                                   ui.allocate_ui_with_layout(
+                                                       egui::vec2(180.0, ui.available_height()),
+                                                                              egui::Layout::top_down(egui::Align::Min),
+                                                                              |ui| {
+                                                                                  egui::ScrollArea::vertical()
+                                                                                  .id_source("places_scroll")
+                                                                                  .auto_shrink([false, false])
+                                                                                  .show(ui, |ui| {
+                                                                                      ui.add_space(8.0);
+                                                                                      ui.heading("Places");
+
+                                                                                      let xdg = [
+                                                                                          ("🏠 Home", dirs::home_dir()),
+                                                                                        ("📥 Downloads", dirs::download_dir()),
+                                                                                        ("🖼️ Pictures", dirs::picture_dir()),
+                                                                                        ("🗑️ Trash", Some(dirs::home_dir().unwrap().join(".local/share/Trash/files")))
+                                                                                      ];
+                                                                                      for (name, path) in xdg {
+                                                                                          if let Some(p) = path {
+                                                                                              if p.exists() && ui.button(name).clicked() { fm_actions.push(FmAction::Navigate(p)); }
+                                                                                          }
+                                                                                      }
+
+                                                                                      ui.separator();
+                                                                                      let mounts = self.fm.mounts.clone();
+                                                                                      for mount in mounts {
+                                                                                          if ui.button(format!("💽 {}", mount.display())).clicked() { fm_actions.push(FmAction::Navigate(mount)); }
+                                                                                      }
+                                                                                  });
+                                                                              }
+                                                   );
+                                                   ui.separator();
+                                               }
+
+                                               ui.allocate_ui_with_layout(
+                                                   egui::vec2(ui.available_width(), ui.available_height()),
+                                                                          egui::Layout::top_down(egui::Align::Min),
+                                                                          |ui| {
+                                                                              if self.fm.view_mode == ViewMode::List {
+                                                                                  egui::ScrollArea::vertical()
+                                                                                  .id_source("list_scroll")
+                                                                                  .auto_shrink([false, false])
+                                                                                  .show(ui, |ui| {
+                                                                                      let entries = std::mem::take(&mut self.fm.entries);
+                                                                                      for entry in &entries {
+                                                                                          let icon = if entry.is_dir { "📁" } else { "📄" };
+                                                                                          let resp = ui.selectable_label(self.fm.selected.contains(&entry.path), format!("{} {}", icon, entry.name));
+
+                                                                                          if resp.double_clicked() {
+                                                                                              if entry.is_dir { fm_actions.push(FmAction::Navigate(entry.path.clone())); }
+                                                                                              else { fm_actions.push(FmAction::OpenSmart(entry.path.clone())); }
+                                                                                          }
+
+                                                                                          resp.context_menu(|ui| {
+                                                                                              if ui.button("Open").clicked() { fm_actions.push(FmAction::OpenSmart(entry.path.clone())); ui.close_menu(); }
+                                                                                              if ui.button("Open Terminal Here").clicked() { fm_actions.push(FmAction::OpenTerminal(entry.path.clone())); ui.close_menu(); }
+                                                                                              if ui.button("Move to Trash").clicked() { fm_actions.push(FmAction::Trash(entry.path.clone())); ui.close_menu(); }
+                                                                                          });
+                                                                                      }
+                                                                                      self.fm.entries = entries;
+                                                                                  });
+                                                                              } else if let Some(gallery) = &mut self.gallery {
+                                                                                  gallery.show(ui, &self.theme);
+
+                                                                                  if gallery.request_open_viewer {
+                                                                                      self.viewer_open = true;
+                                                                                      gallery.request_open_viewer = false;
+                                                                                  }
+                                                                              }
+                                                                          }
+                                               );
+                                           });
+                                       }
+            );
         });
 
+        // Execute file manager actions
+        for action in fm_actions {
+            match action {
+                FmAction::Navigate(p) => { self.fm.navigate_to(p); self.gallery = None; }
+                FmAction::OpenSmart(p) => { self.fm.open_smart(&p); }
+                FmAction::OpenTerminal(p) => {
+                    let dir = if p.is_dir() { p } else { p.parent().unwrap_or(&p).to_path_buf() };
+                    for t in ["konsole", "gnome-terminal", "alacritty", "kitty", "xterm"] {
+                        if std::process::Command::new(t).current_dir(&dir).spawn().is_ok() { break; }
+                    }
+                }
+                FmAction::Trash(p) => { let _ = trash::delete(p); self.fm.refresh(); }
+            }
+        }
+
         if let Some(x) = &self.x11 {
-            let px: Vec<[i32; 4]> = regions
-            .iter()
-            .map(|r| {
+            let px: Vec<[i32; 4]> = regions.iter().map(|r| {
                 let (x0, y0) = ((r.min.x * ppp).round() as i32, (r.min.y * ppp).round() as i32);
                 let (x1, y1) = ((r.max.x * ppp).round() as i32, (r.max.y * ppp).round() as i32);
                 [x0, y0, x1 - x0, y1 - y0]
-            })
-            .collect();
+            }).collect();
             if px != self.last_regions {
                 x.set_input_region(&px);
                 self.last_regions = px;
             }
         }
 
-        // Open the viewer if the gallery asked for it.
-        if self.gallery.request_open_viewer {
-            self.viewer_open = true;
-            self.gallery.request_open_viewer = false;
-        }
-
+        // --- Viewport Logic ---
         let viewer_path: Option<String> = if self.viewer_open {
-            self.gallery.viewer_target.clone()
-            .or_else(|| self.gallery.selected_images.first().cloned())
+            self.gallery.as_ref().and_then(|g| g.viewer_target.clone())
+            .or_else(|| self.gallery.as_ref().and_then(|g| g.selected_images.first().cloned()))
         } else {
             None
         };
@@ -145,10 +251,16 @@ impl eframe::App for SymtropyApp {
                 self.viewer_anim_durations.clear();
                 self.viewer_player = None;
                 self.viewer_needs_fit = true;
+                self.is_edit_mode = false;
 
-                let is_video = path.to_lowercase().ends_with(".mp4")
-                || path.to_lowercase().ends_with(".webm")
-                || path.to_lowercase().ends_with(".mkv");
+                if let Some(gallery) = &self.gallery {
+                    self.staged_sidecar = gallery.items.iter().find(|i| i.path == path).map(|i| i.sidecar.clone());
+                    if let Some(g) = &mut self.gallery {
+                        g.active_tags = self.staged_sidecar.as_ref().map(|sc| sc.tags.iter().cloned().collect()).unwrap_or_default();
+                    }
+                }
+
+                let is_video = path.to_lowercase().ends_with(".mp4") || path.to_lowercase().ends_with(".webm") || path.to_lowercase().ends_with(".mkv");
 
                 if !is_video {
                     if path.to_lowercase().ends_with(".webp") {
@@ -162,10 +274,7 @@ impl eframe::App for SymtropyApp {
                                     if w.max(h) > 2048 {
                                         img = image::imageops::resize(&img, 2048, 2048, image::imageops::FilterType::Lanczos3);
                                     }
-                                    let ci = egui::ColorImage::from_rgba_unmultiplied(
-                                        [img.width() as usize, img.height() as usize],
-                                                                                      img.as_raw(),
-                                    );
+                                    let ci = egui::ColorImage::from_rgba_unmultiplied([img.width() as usize, img.height() as usize], img.as_raw());
                                     t_frames.push(ctx.load_texture(format!("{}_f{}", path, t_frames.len()), ci, egui::TextureOptions::LINEAR));
                                     timestamps.push(frame.timestamp() as f32);
                                 }
@@ -192,11 +301,7 @@ impl eframe::App for SymtropyApp {
                             let img = img.to_rgba8();
                             let size = [img.width() as usize, img.height() as usize];
                             let pixels = img.as_flat_samples();
-                            ctx.load_texture(
-                                &path,
-                                egui::ColorImage::from_rgba_unmultiplied(size, pixels.as_slice()),
-                                             egui::TextureOptions::LINEAR,
-                            )
+                            ctx.load_texture(&path, egui::ColorImage::from_rgba_unmultiplied(size, pixels.as_slice()), egui::TextureOptions::LINEAR)
                         });
                         self.viewer_cache.insert(path.clone(), tex_opt);
                     }
@@ -208,47 +313,48 @@ impl eframe::App for SymtropyApp {
             let mut viewer_player = std::mem::take(&mut self.viewer_player);
             let anim_frames = std::mem::take(&mut self.viewer_anim_frames);
             let anim_durs = std::mem::take(&mut self.viewer_anim_durations);
-            let mut anim_start = std::mem::take(&mut self.gallery.anim_start);
             let mut zoom = self.viewer_zoom;
             let mut pan = self.viewer_pan;
             let mut show_sidebar = self.viewer_show_sidebar;
             let mut sidebar_width = self.viewer_sidebar_width;
             let mut needs_fit = self.viewer_needs_fit;
 
-            let tag_tree = self.gallery.tag_tree.clone();
-            let mut active_tags = self.gallery.active_tags.clone();
-            let mut search_query = self.gallery.tag_search_query.clone();
-            let selected_count = self.gallery.selected_images.len();
+            let mut is_edit_mode = self.is_edit_mode;
+            let mut staged_sidecar = self.staged_sidecar.take();
+            let mut filter_query = self.filter_query.clone();
 
-            // Query state (filter box now lives here in the viewer).
-            let mut query_input = self.gallery.query_input.clone();
-            let mut active_query = self.gallery.active_query.clone();
-            let mut query_error = self.gallery.query_error.clone();
+            // Capture the gallery's query state so the sidebar can update it
+            let mut active_query = self.gallery.as_ref()
+            .map(|g| g.active_query.clone())
+            .unwrap_or(crate::gallery::Query::AlwaysTrue);
+            let mut query_input = self.gallery.as_ref()
+            .map(|g| g.query_input.clone())
+            .unwrap_or_default();
 
+            let (tag_tree, mut active_tags, mut search_query) = if let Some(g) = &self.gallery {
+                (g.tag_tree.clone(), g.active_tags.clone(), g.tag_search_query.clone())
+            } else {
+                (crate::gallery::TagNode { name: "Root".into(), children: vec![] }, Default::default(), String::new())
+            };
+
+            let mut apply_clicked = false;
+            let mut revert_clicked = false;
             let short_name = path.rsplit('/').next().unwrap_or("").to_string();
-            let is_video = path.to_lowercase().ends_with(".mp4")
-            || path.to_lowercase().ends_with(".webm")
-            || path.to_lowercase().ends_with(".mkv");
+            let is_video = path.to_lowercase().ends_with(".mp4") || path.to_lowercase().ends_with(".webm") || path.to_lowercase().ends_with(".mkv");
 
             ctx.show_viewport_immediate(
                 egui::ViewportId::from_hash_of("media_viewer"),
                                         egui::ViewportBuilder::default()
                                         .with_title(&short_name)
-                                        .with_inner_size([1200.0, 800.0])
-                                        .with_min_inner_size([600.0, 200.0])
+                                        .with_inner_size([1400.0, 900.0])
+                                        .with_min_inner_size([800.0, 400.0])
                                         .with_decorations(false)
                                         .with_transparent(true),
                                         |ctx, _class| {
-                                            if ctx.input(|i| i.key_pressed(egui::Key::Escape)) {
-                                                still_open = false;
-                                            }
-                                            if ctx.input(|i| i.key_pressed(egui::Key::Tab)) {
-                                                show_sidebar = !show_sidebar;
-                                            }
+                                            if ctx.input(|i| i.key_pressed(egui::Key::Escape)) { still_open = false; }
+                                            if ctx.input(|i| i.key_pressed(egui::Key::Tab)) { show_sidebar = !show_sidebar; }
 
-                                            egui::CentralPanel::default()
-                                            .frame(egui::Frame::none())
-                                            .show(ctx, |ui| {
+                                            egui::CentralPanel::default().frame(egui::Frame::none()).show(ctx, |ui| {
                                                 let rect = ui.max_rect();
                                                 let actual_sidebar_width = if show_sidebar { sidebar_width } else { 0.0 };
                                                 let img_rect = egui::Rect::from_min_max(rect.min, egui::pos2(rect.max.x - actual_sidebar_width, rect.max.y));
@@ -257,27 +363,16 @@ impl eframe::App for SymtropyApp {
                                                 ui.painter().rect_filled(img_rect, 0.0, egui::Color32::from_rgb(15, 15, 20));
                                                 if show_sidebar {
                                                     ui.painter().rect_filled(sidebar_rect, 0.0, egui::Color32::from_rgba_unmultiplied(25, 25, 30, 255));
-                                                    ui.painter().line_segment(
-                                                        [sidebar_rect.min, egui::pos2(sidebar_rect.min.x, sidebar_rect.max.y)],
-                                                                              egui::Stroke::new(1.0_f32, egui::Color32::from_rgb(50, 50, 60)),
-                                                    );
+                                                    ui.painter().line_segment([sidebar_rect.min, egui::pos2(sidebar_rect.min.x, sidebar_rect.max.y)], egui::Stroke::new(1.0_f32, egui::Color32::from_rgb(50, 50, 60)));
                                                 }
 
                                                 let bg_resp = ui.interact(img_rect, ui.id().with("bg"), egui::Sense::click_and_drag());
-
                                                 let mut drag_resp_opt = None;
                                                 if show_sidebar {
-                                                    let drag_bar_rect = egui::Rect::from_min_size(
-                                                        egui::pos2(sidebar_rect.min.x - 6.0, sidebar_rect.min.y),
-                                                                                                  egui::vec2(6.0, sidebar_rect.height()),
-                                                    );
+                                                    let drag_bar_rect = egui::Rect::from_min_size(egui::pos2(sidebar_rect.min.x - 6.0, sidebar_rect.min.y), egui::vec2(6.0, sidebar_rect.height()));
                                                     let dr = ui.interact(drag_bar_rect, ui.id().with("sidebar_drag"), egui::Sense::drag());
-                                                    if dr.hovered() || dr.dragged() {
-                                                        ctx.set_cursor_icon(egui::CursorIcon::ResizeHorizontal);
-                                                    }
-                                                    if dr.dragged() {
-                                                        sidebar_width = (sidebar_width - dr.drag_delta().x).clamp(200.0, rect.width() - 400.0);
-                                                    }
+                                                    if dr.hovered() || dr.dragged() { ctx.set_cursor_icon(egui::CursorIcon::ResizeHorizontal); }
+                                                    if dr.dragged() { sidebar_width = (sidebar_width - dr.drag_delta().x).clamp(400.0, rect.width() - 400.0); }
                                                     drag_resp_opt = Some(dr);
                                                 }
 
@@ -286,16 +381,10 @@ impl eframe::App for SymtropyApp {
                                                 let toggle_rect = egui::Rect::from_min_size(img_rect.max - egui::vec2(104.0, 56.0), egui::vec2(40.0, 40.0));
                                                 let toggle_resp = ui.interact(toggle_rect, ui.id().with("sidebar_toggle"), egui::Sense::click());
 
-                                                let over_ui = close_resp.hovered()
-                                                || toggle_resp.hovered()
-                                                || drag_resp_opt.as_ref().map_or(false, |r| r.hovered() || r.dragged());
+                                                let over_ui = close_resp.hovered() || toggle_resp.hovered() || drag_resp_opt.as_ref().map_or(false, |r| r.hovered() || r.dragged());
 
-                                                if bg_resp.dragged_by(egui::PointerButton::Primary) && !over_ui {
-                                                    pan += bg_resp.drag_delta();
-                                                }
-                                                if bg_resp.double_clicked() {
-                                                    needs_fit = true;
-                                                }
+                                                if bg_resp.dragged_by(egui::PointerButton::Primary) && !over_ui { pan += bg_resp.drag_delta(); }
+                                                if bg_resp.double_clicked() { needs_fit = true; }
 
                                                 let scroll = ui.input(|i| i.raw_scroll_delta.y);
                                                 if scroll != 0.0 && !over_ui {
@@ -334,27 +423,22 @@ impl eframe::App for SymtropyApp {
                                                                 needs_fit = false;
                                                             }
                                                             let mut rgba = Vec::with_capacity(bgra.len());
-                                                            for chunk in bgra.chunks_exact(4) {
-                                                                rgba.push(chunk[2]); rgba.push(chunk[1]); rgba.push(chunk[0]); rgba.push(chunk[3]);
-                                                            }
+                                                            for chunk in bgra.chunks_exact(4) { rgba.push(chunk[2]); rgba.push(chunk[1]); rgba.push(chunk[0]); rgba.push(chunk[3]); }
                                                             let image = egui::ColorImage::from_rgba_unmultiplied([width as usize, height as usize], &rgba);
                                                             let tex = ctx.load_texture("video_frame", image, egui::TextureOptions::LINEAR);
                                                             let img_size = egui::vec2(width as f32, height as f32) * zoom;
                                                             let display_rect = egui::Rect::from_center_size(img_rect.center() + pan, img_size);
                                                             let full_uv = egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0));
-                                                            let clipped_painter = ui.painter().with_clip_rect(img_rect);
-                                                            clipped_painter.image(tex.id(), display_rect, full_uv, egui::Color32::WHITE);
+                                                            ui.painter().with_clip_rect(img_rect).image(tex.id(), display_rect, full_uv, egui::Color32::WHITE);
                                                         }
                                                         ctx.request_repaint();
-                                                        for event in player.events().try_iter() {
-                                                            if let PlayerEvent::Ended = event { still_open = false; }
-                                                        }
+                                                        for event in player.events().try_iter() { if let PlayerEvent::Ended = event { still_open = false; } }
                                                     }
                                                 } else {
                                                     let mut texture_to_draw = None;
                                                     if !anim_frames.is_empty() {
                                                         let now = ctx.input(|i| i.time);
-                                                        let start = *anim_start.entry(path.clone()).or_insert(now);
+                                                        let start = *self.gallery.as_ref().unwrap().anim_start.get(&path).unwrap_or(&now);
                                                         let frame_idx = frame_from_time(&anim_durs, now - start);
                                                         ctx.request_repaint();
                                                         texture_to_draw = Some(&anim_frames[frame_idx]);
@@ -376,8 +460,7 @@ impl eframe::App for SymtropyApp {
                                                         let img_size = tex.size_vec2() * zoom;
                                                         let display_rect = egui::Rect::from_center_size(img_rect.center() + pan, img_size);
                                                         let full_uv = egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0));
-                                                        let clipped_painter = ui.painter().with_clip_rect(img_rect);
-                                                        clipped_painter.image(tex.id(), display_rect, full_uv, egui::Color32::WHITE);
+                                                        ui.painter().with_clip_rect(img_rect).image(tex.id(), display_rect, full_uv, egui::Color32::WHITE);
                                                     }
                                                 }
 
@@ -391,101 +474,105 @@ impl eframe::App for SymtropyApp {
                                                 ui.painter().text(toggle_rect.center(), egui::Align2::CENTER_CENTER, toggle_icon, egui::FontId::proportional(18.0), egui::Color32::WHITE);
 
                                                 if show_sidebar {
-                                                    let mut sidebar_ui = ui.child_ui(sidebar_rect, egui::Layout::top_down(egui::Align::Min));
-                                                    sidebar_ui.set_clip_rect(sidebar_rect);
-
-                                                    // --- Query filter (moved here from the masonry view) ---
-                                                    sidebar_ui.add_space(8.0);
-                                                    sidebar_ui.horizontal(|ui| {
-                                                        ui.add_space(8.0);
-                                                        let avail = (sidebar_rect.width() - 16.0).max(100.0);
-                                                        let resp = ui.add_sized(
-                                                            [avail, 22.0],
-                                                            egui::TextEdit::singleline(&mut query_input)
-                                                            .hint_text("filter: fox + plush")
-                                                            .font(egui::TextStyle::Monospace),
-                                                        );
-                                                        if resp.changed() {
-                                                            match Query::parse(&query_input) {
-                                                                Ok(q) => {
-                                                                    active_query = q;
-                                                                    query_error = None;
-                                                                }
-                                                                Err(e) => {
-                                                                    query_error = Some(e);
-                                                                }
-                                                            }
-                                                        }
-                                                    });
-                                                    if let Some(err) = &query_error {
-                                                        sidebar_ui.horizontal(|ui| {
-                                                            ui.add_space(8.0);
-                                                            ui.label(
-                                                                egui::RichText::new(format!("⚠ {}", err))
-                                                                .color(egui::Color32::from_rgb(220, 100, 100))
-                                                                .font(egui::FontId::monospace(10.0)),
-                                                            );
-                                                        });
-                                                    }
-                                                    sidebar_ui.add_space(6.0);
-                                                    sidebar_ui.separator();
-                                                    sidebar_ui.add_space(6.0);
-
-                                                    // --- Tag editing ---
-                                                    sidebar_ui.horizontal(|ui| {
-                                                        ui.add_space(12.0);
-                                                        ui.heading(egui::RichText::new(format!("Tags ({})", selected_count)).color(egui::Color32::WHITE));
-                                                    });
-                                                    sidebar_ui.add_space(8.0);
-                                                    sidebar_ui.horizontal(|ui| {
-                                                        ui.add_space(12.0);
-                                                        ui.add_sized([sidebar_rect.width() - 24.0, 24.0], egui::TextEdit::singleline(&mut search_query).hint_text("Search tags..."));
-                                                    });
-                                                    sidebar_ui.add_space(8.0);
-                                                    sidebar_ui.separator();
-                                                    sidebar_ui.add_space(4.0);
-                                                    egui::ScrollArea::vertical().show(&mut sidebar_ui, |ui| {
-                                                        ui.add_space(4.0);
-                                                        draw_tag_node(ui, &tag_tree, &mut active_tags);
-                                                    });
-                                                    sidebar_ui.with_layout(egui::Layout::bottom_up(egui::Align::Center), |ui| {
-                                                        ui.add_space(12.0);
-                                                        if ui.add_sized([sidebar_rect.width() - 24.0, 32.0], egui::Button::new("Apply Tags")).clicked() {
-                                                            println!("Applied {:?} to {} images", active_tags, selected_count);
-                                                        }
-                                                        ui.add_space(12.0);
-                                                    });
+                                                    let (apply, revert) = crate::sidebar::draw_sidebar(
+                                                        ui, sidebar_rect, &mut is_edit_mode, &mut staged_sidecar, &mut filter_query, &tag_tree, &mut active_tags, &mut search_query
+                                                    );
+                                                    if apply { apply_clicked = true; }
+                                                    if revert { revert_clicked = true; }
                                                 }
                                             });
 
-                                            if ctx.input(|i| i.viewport().close_requested()) {
-                                                still_open = false;
-                                            }
+                                            if ctx.input(|i| i.viewport().close_requested()) { still_open = false; }
                                         },
             );
 
-            // Restore shared state.
+            // Apply
+            if apply_clicked {
+                if is_edit_mode {
+                    if let Some(sc) = &staged_sidecar {
+                        let mut targets = self.gallery.as_ref().unwrap().selected_images.clone();
+                        if targets.is_empty() { targets.push(path.clone()); }
+                        for p in targets {
+                            if let Some(g) = &mut self.gallery {
+                                if let Some(item) = g.items.iter_mut().find(|i| i.path == p) {
+                                    item.sidecar = sc.clone();
+                                    item.tags = sc.tags.iter().cloned().collect();
+                                    item.rating = sc.rating;
+                                    let _ = item.sidecar.save(Path::new(&item.path));
+
+                                    let index_path = crate::gallery::workers::cache_dir().join("index.tsv");
+                                    crate::gallery::workers::update_index_entry(
+                                        &index_path,
+                                        &item.path,
+                                        &item.sidecar.tags,
+                                        item.sidecar.rating,
+                                    );
+                                }
+                            }
+                        }
+                    }
+                } else {
+                    // Filter mode: build a Query from the sidebar fields and apply it
+                    let mut parts = Vec::new();
+                    if !filter_query.tags.trim().is_empty() {
+                        parts.push(filter_query.tags.trim().to_string());
+                    }
+
+                    let full_query = parts.join(" + ");
+                    query_input = full_query.clone();
+
+                    match crate::gallery::query::Query::parse(&full_query) {
+                        Ok(q) => {
+                            eprintln!("gallery: applied filter '{}'", full_query);
+                            active_query = q;
+                        }
+                        Err(e) => {
+                            eprintln!("gallery: filter parse error: {}", e);
+                        }
+                    }
+                }
+            }
+
+            // Revert
+            if revert_clicked {
+                if is_edit_mode {
+                    if let Some(g) = &self.gallery {
+                        if let Some(item) = g.items.iter().find(|i| i.path == path) {
+                            staged_sidecar = Some(item.sidecar.clone());
+                            active_tags = item.tags.clone();
+                        }
+                    }
+                } else {
+                    filter_query = FilterQuery::default();
+                    active_query = crate::gallery::Query::AlwaysTrue;
+                    query_input.clear();
+                    eprintln!("gallery: filter cleared");
+                }
+            }
+
             self.viewer_cache = viewer_cache;
             self.viewer_player = viewer_player;
             self.viewer_anim_frames = anim_frames;
             self.viewer_anim_durations = anim_durs;
-            self.gallery.anim_start = anim_start;
             self.viewer_zoom = zoom;
             self.viewer_pan = pan;
             self.viewer_needs_fit = needs_fit;
             self.viewer_show_sidebar = show_sidebar;
             self.viewer_sidebar_width = sidebar_width;
-            self.gallery.active_tags = active_tags;
-            self.gallery.tag_search_query = search_query;
-            self.gallery.query_input = query_input;
-            self.gallery.active_query = active_query;
-            self.gallery.query_error = query_error;
+            self.is_edit_mode = is_edit_mode;
+            self.staged_sidecar = staged_sidecar;
+            self.filter_query = filter_query;
+            if let Some(g) = &mut self.gallery {
+                g.active_tags = active_tags;
+                g.tag_search_query = search_query;
+                g.active_query = active_query;
+                g.query_input = query_input;
+            }
 
             if !still_open {
                 self.viewer_open = false;
                 self.viewer_loaded_path = None;
-                self.gallery.viewer_target = None;
-                self.gallery.selected_images.clear();
+                if let Some(g) = &mut self.gallery { g.viewer_target = None; g.selected_images.clear(); }
                 self.viewer_cache.clear();
                 self.viewer_player = None;
                 self.viewer_anim_frames.clear();

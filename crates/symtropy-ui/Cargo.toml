@@ -4,6 +4,7 @@ version = "0.1.0"
 edition = "2021"
 
 [dependencies]
+webp = "0.3"
 eframe = { workspace = true }
 egui = { workspace = true }
 image = { workspace = true }
@@ -12,9 +13,23 @@ alhazen-core = { workspace = true }
 x11rb = { workspace = true }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+quick-xml = "0.36"
+rayon = { workspace = true }
+rusqlite = { workspace = true }
+dirs = { workspace = true }
+open = { workspace = true }
+trash = { workspace = true }
+sysinfo = { workspace = true }
+urlencoding = "2.1"
 
-[profile.dev.package."*"]
-opt-level = 3
+[[example]]
+name = "convert"
+path = "examples/convert.rs"
 
-[profile.dev]
-opt-level = 1
+[[example]]
+name = "migrate_sidecars"
+path = "examples/migrate_sidecars.rs"
+
+[[example]]
+name = "rescue_digikam"
+path = "examples/rescue_digikam.rs"
