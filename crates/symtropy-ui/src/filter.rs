@@ -48,6 +48,14 @@ impl FilterBatch {
         }
     }
 
+    /// Add a solid triangle mask. Used for geometric selection markings such
+    /// as the rating star on selected gallery thumbnails.
+    pub fn triangle(&mut self, a: egui::Pos2, b: egui::Pos2, c: egui::Pos2, alpha: f32) {
+        for p in [a, b, c] {
+            self.v(p.x, p.y, -1.0, -1.0, alpha);
+        }
+    }
+
     pub fn frame(&mut self, r: Rect, t: f32, alpha: f32) {
         self.rect(Rect::from_min_max(r.min, pos2(r.max.x, r.min.y + t)), alpha);
         self.rect(Rect::from_min_max(pos2(r.min.x, r.max.y - t), r.max), alpha);

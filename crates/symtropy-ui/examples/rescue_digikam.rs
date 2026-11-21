@@ -1,5 +1,11 @@
 //! Rescue tags directly from DigiKam's SQLite database.
-//! Usage: cargo run --release -p symtropy-ui --example rescue_digikam <path_to_digikam4.db> <fallback_dir>
+//!
+//! Usage:
+//!   cargo run --release -p symtropy-ui --example rescue_digikam \
+//!       <path_to_digikam4.db> <fallback_dir> [mount_root]
+//!
+//! `mount_root` is the machine-specific prefix that old `/Pictures/...` album
+//! paths should be rebased onto. It can also be set via SYMTROPY_MOUNT_ROOT.
 
 use rusqlite::{Connection, OpenFlags};
 use std::collections::HashMap;
@@ -18,12 +24,15 @@ pub struct Sidecar {
 fn main() {
     let args: Vec<String> = std::env::args().collect();
     if args.len() < 3 {
-        eprintln!("Usage: {} <path_to_digikam4.db> <fallback_dir>", args[0]);
+        eprintln!("Usage: {} <path_to_digikam4.db> <fallback_dir> [mount_root]", args[0]);
         return;
     }
 
     let db_path = Path::new(&args[1]);
     let fallback_dir = Path::new(&args[2]);
+    let mount_root = args.get(3).map(PathBuf::from).or_else(|| {
+        std::env::var_os("SYMTROPY_MOUNT_ROOT").map(PathBuf::from)
+    });
 
     println!("Opening DigiKam DB at {} (Read-Only)...", db_path.display());
 
@@ -95,12 +104,14 @@ fn main() {
         // Try to find the file. If it doesn't exist, try the fallback heuristics.
         let mut final_path = path.clone();
 
-        // Heuristic 1: Prepend mount root if it starts with /Pictures
+        // Heuristic 1: Rebase old /Pictures paths onto the current mount root.
         if !final_path.exists() && final_path.starts_with("/Pictures") {
-            let rel_path = final_path.strip_prefix("/").unwrap();
-            let mounted = PathBuf::from("/run/media/cashmere/Creationism").join(rel_path);
-            if mounted.exists() {
-                final_path = mounted;
+            if let Some(root) = &mount_root {
+                let rel_path = final_path.strip_prefix("/").unwrap();
+                let mounted = root.join(rel_path);
+                if mounted.exists() {
+                    final_path = mounted;
+                }
             }
         }
 

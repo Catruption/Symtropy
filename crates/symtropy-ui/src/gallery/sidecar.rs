@@ -163,13 +163,37 @@ impl Sidecar {
         Self::load_with_source(image_path).map(|(s, _)| s)
     }
 
+    /// Cheap rating lookup for sorting large folders. Only the canonical JSON
+    /// sidecar is consulted; legacy/XML fallback is handled by the full scanner.
+    pub fn quick_rating(image_path: &Path) -> u8 {
+        #[derive(serde::Deserialize)]
+        struct RatingOnly {
+            #[serde(default)]
+            rating: u8,
+        }
+
+        std::fs::read_to_string(Self::path_for(image_path))
+            .ok()
+            .and_then(|text| serde_json::from_str::<RatingOnly>(&text).ok())
+            .map(|parsed| parsed.rating)
+            .unwrap_or(0)
+    }
+
     pub fn save(&self, image_path: &Path) -> std::io::Result<()> {
         let json_path = Self::path_for(image_path);
         let text = serde_json::to_string_pretty(self)
         .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?;
-        let tmp = json_path.with_extension("json.tmp");
-        std::fs::write(&tmp, text)?;
-        std::fs::rename(&tmp, &json_path)?;
+
+        // Do not replace the sidecar when nothing changed. The temp-file rename
+        // is otherwise invisible to the image cache but still churns mtimes.
+        let unchanged = std::fs::read_to_string(&json_path)
+            .map(|old| old == text)
+            .unwrap_or(false);
+        if !unchanged {
+            let tmp = json_path.with_extension("json.tmp");
+            std::fs::write(&tmp, text)?;
+            std::fs::rename(&tmp, &json_path)?;
+        }
 
         // Clean up legacy file if it somehow still exists
         let legacy = Self::legacy_json_path(image_path);
@@ -312,4 +336,22 @@ pub fn parse_digikam_xml(xml: &str) -> Result<Sidecar, String> {
     sc.tags.sort();
     sc.tags.dedup();
     Ok(sc)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn quick_rating_reads_canonical_sidecar() {
+        let dir = std::env::temp_dir().join(format!("symtropy-rating-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let image = dir.join("photo.webp");
+        std::fs::write(Sidecar::path_for(&image), r#"{"rating":5}"#).unwrap();
+
+        assert_eq!(Sidecar::quick_rating(&image), 5);
+        assert_eq!(Sidecar::quick_rating(&dir.join("missing.webp")), 0);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
 }

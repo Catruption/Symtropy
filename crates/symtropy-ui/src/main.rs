@@ -1,7 +1,10 @@
+mod actions;
 mod app;
 mod filter;
 mod gallery;
 mod file_manager;
+mod paths;
+mod pathbar;
 mod sidebar;
 mod theme;
 mod window;
@@ -17,18 +20,29 @@ fn main() -> eframe::Result<()> {
         std::env::remove_var("WAYLAND_DISPLAY");
     }
 
+    // Optional positional argument: the image library to open. Falls back to
+    // SYMTROPY_LIBRARY, then an executable/cwd-relative lookup. An explicit
+    // choice overrides the directory remembered in the saved UI state.
+    let explicit_library = std::env::args_os()
+        .nth(1)
+        .map(std::path::PathBuf::from)
+        .or_else(paths::env_library_dir);
+    let library = explicit_library
+        .clone()
+        .unwrap_or_else(paths::default_library_dir);
+
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
         .with_title("Symtropy")
         .with_inner_size([1400.0, 900.0])
-        .with_min_inner_size([800.0, 400.0])
         .with_decorations(false)
-        .with_transparent(true),
+        .with_transparent(true)
+        .with_drag_and_drop(true),
         ..Default::default()
     };
     eframe::run_native(
         "Symtropy",
         options,
-        Box::new(|cc| Box::new(SymtropyApp::new(cc))),
+        Box::new(move |cc| Box::new(SymtropyApp::new(cc, library, explicit_library))),
     )
 }

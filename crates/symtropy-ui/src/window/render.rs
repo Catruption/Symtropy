@@ -6,7 +6,7 @@ pub fn draw_corners(painter: &egui::Painter, theme: &Theme, win: egui::Rect) {
     use egui::{pos2, vec2, Color32, Rect};
     let (Some(tex), Some(cs_pts)) = (&theme.squares, theme.corner_px()) else { return };
     let ppp = painter.ctx().pixels_per_point();
-    let tp = theme.scale() * ppp; // physical pixels per texture pixel (1.0 when 1:1)
+    let tp = theme.decor_scale() * ppp; // physical pixels per texture pixel (1.0 when 1:1)
     let tex_px = tex.size_vec2();
     let cs = cs_pts * ppp; // corner block size in physical pixels
     let ctw = cs / tp; // corner block size in texture pixels
@@ -47,7 +47,7 @@ pub fn draw_edges(painter: &egui::Painter, theme: &Theme, win: egui::Rect) {
     };
     let w = win.width();
     let h = win.height();
-    let tex_size = tex.size_vec2() * theme.scale();
+    let tex_size = tex.size_vec2() * theme.decor_scale();
     if tex_size.x <= 0.0 || tex_size.y <= 0.0 {
         return;
     }

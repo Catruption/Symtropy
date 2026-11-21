@@ -3,11 +3,12 @@
 //! The compositor is told (via _GTK_FRAME_EXTENTS, see x11.rs) that the band is invisible shadow,
 //! so it tiles/maximizes/snaps the *plate*, not the whole OS window: tiled plates sit flush
 //! against screen edges and against other windows, while the overhang spills past them.
+//! The chrome-scale sliders sit in the plate-to-content gutter, not in that overhang band.
 
 mod layout;
 mod render;
 
-use crate::theme::Theme;
+use crate::theme::{self, Theme};
 use egui::{pos2, vec2, Color32, Id, Rect, Sense, Stroke, ViewportCommand};
 use render::{draw_corners, draw_edges};
 
@@ -20,13 +21,12 @@ pub const OVERHANG: f32 = 90.0;
 /// physical pixels at the default scale (it is `OVERHANG` texture pixels), which is exactly what
 /// x11.rs reports to the window manager.
 pub fn overhang(theme: &Theme) -> f32 {
-    (OVERHANG * theme.scale()).min(theme.side(vec2(0.0, 0.0)))
+    (OVERHANG * theme.decor_scale()).min(theme.side(vec2(0.0, 0.0)))
 }
 
 /// Draws the chrome around the whole viewport and runs `add_content` inside the content area.
 /// Returns the rects (in points) that should receive mouse input: the plate plus the window buttons.
 pub fn show(ctx: &egui::Context, theme: &Theme, title: &str, add_content: impl FnOnce(&mut egui::Ui)) -> Vec<Rect> {
-    theme.sync_scale(ctx.pixels_per_point());
     egui::CentralPanel::default().frame(egui::Frame::none()).show(ctx, |ui| {
         let screen = ctx.screen_rect();
         let (maximized, fullscreen) =
@@ -55,6 +55,19 @@ pub fn show(ctx: &egui::Context, theme: &Theme, title: &str, add_content: impl F
         theme.title_font(),
                  Theme::parse_color(&theme.config.title_bar.color),
     );
+
+    // ---- gutter sliders: chrome settings inside the theme's side buffer ----
+    if fullscreen {
+        ui.memory_mut(|m| m.data.remove_temp::<FrozenStrip>(Id::new(SCALE_DRAG_ID)));
+    } else {
+        // These hug the content edge inside the plate-to-content band. The frame slider shrinks
+        // the plate and content together, so draw_scale_strip freezes the rail at drag start;
+        // otherwise the shrinking content would make the track chase the pointer.
+        let (left, right) = scale_strip_rects(plate, layout.content);
+        let frozen = ui.memory(|m| m.data.get_temp::<FrozenStrip>(Id::new(SCALE_DRAG_ID)));
+        draw_scale_strip(ui, theme, left, ScaleKind::Frame, screen.size(), frozen);
+        draw_scale_strip(ui, theme, right, ScaleKind::Buttons, screen.size(), frozen);
+    }
 
     let toggle_max = || ctx.send_viewport_cmd(ViewportCommand::Maximized(!maximized));
 
@@ -93,11 +106,13 @@ pub fn show(ctx: &egui::Context, theme: &Theme, title: &str, add_content: impl F
         }
     }
 
-    // ---- resize along the viewport edge, and shift+drag anywhere to move ----
+    // ---- resize along the viewport edge, and shift+drag the titlebar to move ----
     let (pressed, pos, shift) =
     ctx.input(|i| (i.pointer.primary_pressed(), i.pointer.latest_pos(), i.modifiers.shift));
     if let Some(p) = pos {
-        if pressed && shift && plate.contains(p) {
+        // Only the titlebar consumes Shift. Content clicks need it for range
+        // selection, so a Shift+click inside `content` must never start a drag.
+        if pressed && shift && bar.contains(p) {
             ctx.send_viewport_cmd(ViewportCommand::StartDrag);
         } else if !(maximized || fullscreen) {
             if let Some(dir) = layout::border_dir(p, plate, BORDER) {
@@ -127,7 +142,210 @@ pub fn show(ctx: &egui::Context, theme: &Theme, title: &str, add_content: impl F
     .inner
 }
 
+const SCALE_DRAG_ID: &str = "chrome-scale-drag";
+const STRIP_MAX_WIDTH: f32 = 24.0;
+const STRIP_MIN_WIDTH: f32 = 8.0;
+const STRIP_GAP: f32 = 2.0;
+const STRIP_END_PAD: f32 = 18.0;
+
+/// Vertical strips in the plate-to-content gutters, tight against the content edge.
+/// The theme's side buffer is only ~16–20 points wide, so the strip is sized from that gutter
+/// rather than given a fixed width that would be clipped by the plate.
+fn scale_strip_rects(plate: Rect, content: Rect) -> (Rect, Rect) {
+    let top = content.top() + STRIP_END_PAD;
+    let bottom = content.bottom() - STRIP_END_PAD;
+    let left_gutter = content.left() - plate.left();
+    let right_gutter = plate.right() - content.right();
+    let left_w = strip_width(left_gutter);
+    let right_w = strip_width(right_gutter);
+
+    let left_max = content.left() - STRIP_GAP;
+    let right_min = content.right() + STRIP_GAP;
+    let left = Rect::from_min_max(pos2(left_max - left_w, top), pos2(left_max, bottom)).intersect(plate);
+    let right = Rect::from_min_max(pos2(right_min, top), pos2(right_min + right_w, bottom)).intersect(plate);
+    (left, right)
+}
+
+fn strip_width(gutter: f32) -> f32 {
+    (gutter - 2.0 * STRIP_GAP)
+        .clamp(STRIP_MIN_WIDTH, STRIP_MAX_WIDTH)
+        .min(gutter.max(0.0))
+}
+
+/// While a scale is being dragged, keep its strip at the geometry the drag began with.
+#[derive(Clone, Copy)]
+struct FrozenStrip {
+    kind: ScaleKind,
+    rect: Rect,
+}
+
+impl Default for FrozenStrip {
+    fn default() -> Self {
+        Self {
+            kind: ScaleKind::Frame,
+            rect: Rect::from_min_size(pos2(0.0, 0.0), vec2(0.0, 0.0)),
+        }
+    }
+}
+
+#[derive(Clone, Copy, PartialEq)]
+enum ScaleKind {
+    Frame,
+    Buttons,
+}
+
+impl ScaleKind {
+    fn label(self) -> &'static str {
+        match self {
+            Self::Frame => "F",
+            Self::Buttons => "B",
+        }
+    }
+
+    fn tooltip(self, value: f32) -> String {
+        let what = match self {
+            Self::Frame => "Frame / corner image scale",
+            Self::Buttons => "Window button scale",
+        };
+        format!("{what}\n{value:.2}× — drag to adjust")
+    }
+
+    fn value(self, theme: &Theme, screen: egui::Vec2) -> f32 {
+        match self {
+            Self::Frame => theme.frame_scale_setting().max(theme.min_frame_scale(screen)),
+            Self::Buttons => theme.button_scale_setting(),
+        }
+    }
+
+    fn range(self, theme: &Theme, screen: egui::Vec2) -> std::ops::RangeInclusive<f32> {
+        match self {
+            Self::Frame => {
+                let min = theme.min_frame_scale(screen);
+                min..=theme.max_frame_scale(screen).max(min)
+            }
+            Self::Buttons => theme::MIN_BUTTON_SCALE..=theme::MAX_BUTTON_SCALE,
+        }
+    }
+
+    fn set(self, theme: &Theme, value: f32, screen: egui::Vec2) {
+        match self {
+            Self::Frame => theme.set_frame_scale(
+                value.clamp(theme.min_frame_scale(screen), theme.max_frame_scale(screen)),
+            ),
+            Self::Buttons => theme.set_button_scale(value),
+        }
+    }
+}
+
+fn draw_scale_strip(
+    ui: &mut egui::Ui,
+    theme: &Theme,
+    rect: Rect,
+    kind: ScaleKind,
+    screen: egui::Vec2,
+    frozen: Option<FrozenStrip>,
+) {
+    let rect = frozen.filter(|f| f.kind == kind).map(|f| f.rect).unwrap_or(rect);
+    if rect.width() < STRIP_MIN_WIDTH || rect.height() < 70.0 {
+        return;
+    }
+
+    let inner = Rect::from_min_max(rect.min + vec2(2.0, 12.0), rect.max - vec2(2.0, 10.0));
+    if inner.height() < 30.0 {
+        return;
+    }
+
+    let hit = Rect::from_center_size(
+        pos2(rect.center().x, inner.center().y),
+        vec2(rect.width(), inner.height()),
+    );
+    let range = kind.range(theme, screen);
+    let (min, max) = (*range.start(), *range.end());
+    let response = ui.interact(hit, Id::new(("chrome_scale", kind.label())), Sense::click_and_drag());
+
+    let drag_id = Id::new(SCALE_DRAG_ID);
+    if response.drag_started() {
+        ui.memory_mut(|m| m.data.insert_temp(drag_id, FrozenStrip { kind, rect }));
+    }
+    let primary_down = ui.input(|i| i.pointer.primary_down());
+    if response.drag_stopped() || (frozen.is_some() && !primary_down) {
+        ui.memory_mut(|m| m.data.remove_temp::<FrozenStrip>(drag_id));
+    }
+
+    if response.dragged() || response.clicked() {
+        if let Some(p) = ui.input(|i| i.pointer.latest_pos()) {
+            let n = ((hit.bottom() - p.y) / hit.height()).clamp(0.0, 1.0);
+            let raw = if max > min { min + n * (max - min) } else { min };
+            let stepped = (raw / 0.05).round() * 0.05;
+            kind.set(theme, stepped.clamp(min, max), screen);
+        }
+    }
+
+    let value = kind.value(theme, screen).clamp(min, max);
+    let n = if max > min { (value - min) / (max - min) } else { 0.0 };
+    let handle_y = hit.bottom() - n * hit.height();
+
+    let painter = ui.painter().clone();
+    painter.rect_filled(rect, 4.0, Color32::from_black_alpha(190));
+    painter.rect_stroke(rect, 4.0, Stroke::new(1.0_f32, Color32::from_white_alpha(40)));
+
+    let rail = Rect::from_center_size(
+        pos2(rect.center().x, hit.center().y),
+        vec2(3.0, hit.height()),
+    );
+    painter.rect_filled(rail, 1.5, Color32::from_white_alpha(70));
+    painter.circle_filled(pos2(rect.center().x, handle_y), 3.5, Color32::from_white_alpha(230));
+
+    painter.text(
+        pos2(rect.center().x, rect.top() + 6.0),
+        egui::Align2::CENTER_CENTER,
+        kind.label(),
+        egui::FontId::proportional(8.0),
+        Color32::from_white_alpha(220),
+    );
+    let _ = response.on_hover_text(kind.tooltip(value));
+}
+
 /// Snap a rect's origin to whole physical pixels so 1:1 textures stay crisp.
 fn snap(r: Rect, ppp: f32) -> Rect {
     Rect::from_min_size(pos2((r.min.x * ppp).round() / ppp, (r.min.y * ppp).round() / ppp), r.size())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn scale_strips_fit_the_real_theme_gutter() {
+        // At 1.25 px/pt the theme's 20px inset is a 16pt gutter. The strips must still fit
+        // without spilling into the content or being clipped by the plate.
+        let plate = Rect::from_min_max(pos2(100.0, 50.0), pos2(1100.0, 850.0));
+        let content = plate.shrink(16.0);
+        let (left, right) = scale_strip_rects(plate, content);
+
+        assert!(plate.contains_rect(left));
+        assert!(plate.contains_rect(right));
+        assert!(!left.intersects(content));
+        assert!(!right.intersects(content));
+        assert_eq!(left.right(), content.left() - STRIP_GAP);
+        assert_eq!(right.left(), content.right() + STRIP_GAP);
+        assert_eq!(left.width(), 12.0);
+        assert_eq!(right.width(), 12.0);
+        assert_eq!(left.height(), content.height() - 2.0 * STRIP_END_PAD);
+        assert_eq!(right.height(), content.height() - 2.0 * STRIP_END_PAD);
+    }
+
+    #[test]
+    fn scale_strips_cap_at_the_max_width_in_a_large_gutter() {
+        let plate = Rect::from_min_max(pos2(100.0, 50.0), pos2(1100.0, 850.0));
+        let content = Rect::from_min_max(pos2(400.0, 150.0), pos2(800.0, 750.0));
+        let (left, right) = scale_strip_rects(plate, content);
+
+        assert!(plate.contains_rect(left));
+        assert!(plate.contains_rect(right));
+        assert!(!left.intersects(content));
+        assert!(!right.intersects(content));
+        assert_eq!(left.width(), STRIP_MAX_WIDTH);
+        assert_eq!(right.width(), STRIP_MAX_WIDTH);
+    }
 }

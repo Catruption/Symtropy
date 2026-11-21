@@ -187,7 +187,17 @@ fn tokenize(input: &str) -> Result<Vec<Token>, String> {
                 let mut word = String::new();
                 while i < chars.len() {
                     let c = chars[i];
-                    if c.is_whitespace() || "()|+!".contains(c) {
+                    if c.is_whitespace() || "()|!".contains(c) {
+                        break;
+                    }
+                    if c == '+' {
+                        // `+` is an AND operator between words, but part of the
+                        // `rating:N+` token. Keep it inside rating words.
+                        if word.starts_with("rating:") {
+                            word.push(c);
+                            i += 1;
+                            continue;
+                        }
                         break;
                     }
                     if c == '-' {
@@ -402,8 +412,10 @@ mod tests {
     }
 
     #[test]
-    fn bare_minus_is_error() {
-        assert!(Query::parse("fox-plush").is_err());
+    fn leading_minus_is_error() {
+        // A hyphen inside a word is part of the tag; only a standalone `-` is
+        // the EXCEPT operator, and it needs a left operand.
+        assert_eq!(Query::parse("fox-plush").unwrap(), Query::Tag("fox-plush".into()));
         assert!(Query::parse("-plush").is_err());
     }
 

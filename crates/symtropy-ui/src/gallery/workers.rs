@@ -1,18 +1,28 @@
-use super::sidecar::{LoadSource, Sidecar};
+use super::sidecar::{LoadSource, Relationship, Sidecar, Source};
 use super::*;
+use serde::{Deserialize, Serialize};
+use std::collections::hash_map::DefaultHasher;
 use std::collections::HashSet;
+use std::hash::{Hash, Hasher};
 use std::path::{Path, PathBuf};
+use std::process::{Command, Stdio};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::mpsc::Sender;
 use std::sync::{Arc, Condvar, Mutex};
 use std::time::{Instant, UNIX_EPOCH};
 
-const ANALYSIS_VERSION: &str = "margins-v5";
+/// Bump whenever the index columns or the cached sidecar fields change.
+const INDEX_VERSION: &str = "sidecar-v6";
 const EDGE_TOL: u8 = 8;
 const MIN_KEEP: u32 = 2;
 const ANALYSIS_PX: u32 = 64;
 const ANIM_FRAME_PX: u32 = 512;
-const VIDEO_EXTS: [&str; 3] = ["mp4", "webm", "mkv"];
+pub const VIDEO_FRAME_PX: u32 = 512;
+pub const VIDEO_EXTS: [&str; 10] = [
+    "mp4", "m4v", "webm", "mkv", "avi", "mov", "wmv", "flv", "mpeg", "mpg",
+];
+pub const VIDEO_DURATION_PROPERTY: &str = "symtropy.video_duration";
+const MAX_VIDEO_EXTRACT: usize = 2;
 const BATCH_SIZE: usize = 256;
 
 /// Sentinel value in index.tsv meaning "this image has never been margin-analyzed".
@@ -22,6 +32,7 @@ const NO_MARGIN_SENTINEL: u32 = u32::MAX;
 pub struct Job {
     pub path: String,
     pub px: [u32; 2],
+    pub duration: Option<f64>,
 }
 
 pub struct Shared {
@@ -47,22 +58,248 @@ pub enum ScanMsg {
     Done,
 }
 
-pub fn cache_dir() -> PathBuf {
-    let base = std::env::var_os("XDG_CACHE_HOME")
-    .map(PathBuf::from)
-    .or_else(|| std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".cache")))
-    .unwrap_or_else(std::env::temp_dir);
-    base.join("symtropy")
-}
+pub use crate::paths::cache_dir;
 
 pub fn mtime_secs(m: &std::fs::Metadata) -> u64 {
     m.modified().ok().and_then(|t| t.duration_since(UNIX_EPOCH).ok()).map(|d| d.as_secs()).unwrap_or(0)
 }
 
-pub fn make_thumb(path: &str, px: [u32; 2]) -> Option<(WorkerThumbContent, egui::ColorImage)> {
+/// Read image dimensions from the file contents, not just the extension.
+///
+/// `image::image_dimensions` only looks at the path extension, so files such as
+/// `photo.jpg%3Alarge` (actually a WebP) are silently skipped on every scan.
+/// Sniffing the header lets those files enter the cache once instead of being
+/// read from disk forever.
+fn image_dimensions(path: &Path) -> Option<(u32, u32)> {
+    image::ImageReader::open(path)
+        .ok()?
+        .with_guessed_format()
+        .ok()?
+        .into_dimensions()
+        .ok()
+}
+
+pub fn is_video_ext(ext: &str) -> bool {
+    let ext = ext.to_ascii_lowercase();
+    VIDEO_EXTS.iter().any(|candidate| *candidate == ext)
+}
+
+pub fn is_video_path(path: &Path) -> bool {
+    path.extension()
+        .map(|e| is_video_ext(&e.to_string_lossy().to_lowercase()))
+        .unwrap_or(false)
+}
+
+pub fn video_duration(sidecar: &Sidecar) -> Option<f64> {
+    sidecar
+        .properties
+        .get(VIDEO_DURATION_PROPERTY)
+        .and_then(|s| s.parse::<f64>().ok())
+        .filter(|d| d.is_finite() && *d > 0.0)
+}
+
+pub fn format_duration(seconds: Option<f64>) -> String {
+    let Some(seconds) = seconds.filter(|s| s.is_finite() && *s >= 0.0) else {
+        return "VIDEO".to_string();
+    };
+    let total = seconds.round() as u64;
+    format!("{}:{:02}", total / 60, total % 60)
+}
+
+fn video_sample_times(duration: Option<f64>) -> [f64; 3] {
+    let d = duration.filter(|d| d.is_finite() && *d > 0.0).unwrap_or(10.0);
+    [d * 0.10, d * 0.50, d * 0.90]
+}
+
+#[derive(Clone, Copy, Debug)]
+struct VideoMeta {
+    width: u32,
+    height: u32,
+    duration: f64,
+}
+
+/// Read dimensions/duration once via ffprobe. This is only called when the
+/// index has no usable cached metadata for the video.
+fn probe_video(path: &Path) -> Option<VideoMeta> {
+    let output = Command::new("ffprobe")
+        .arg("-v").arg("error")
+        .arg("-show_entries")
+        .arg("stream=codec_type,width,height,duration,side_data_list:format=duration")
+        .arg("-of").arg("json")
+        .arg(path)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+
+    let json: serde_json::Value = serde_json::from_slice(&output.stdout).ok()?;
+    let stream = json
+        .get("streams")?
+        .as_array()?
+        .iter()
+        .find(|s| s.get("codec_type").and_then(|v| v.as_str()) == Some("video"))?;
+
+    let mut width = stream.get("width")?.as_u64()? as u32;
+    let mut height = stream.get("height")?.as_u64()? as u32;
+    if stream
+        .get("side_data_list")
+        .and_then(|v| v.as_array())
+        .and_then(|items| {
+            items.iter().find_map(|item| {
+                item.get("rotation")
+                    .and_then(|r| r.as_i64().or_else(|| r.as_str()?.parse().ok()))
+            })
+        })
+        .map(|rotation| rotation.abs() % 180 == 90)
+        .unwrap_or(false)
+    {
+        std::mem::swap(&mut width, &mut height);
+    }
+
+    let duration = json
+        .pointer("/format/duration")
+        .and_then(|v| v.as_str())
+        .and_then(|s| s.parse::<f64>().ok())
+        .or_else(|| {
+            stream
+                .get("duration")
+                .and_then(|v| v.as_str())
+                .and_then(|s| s.parse::<f64>().ok())
+        })
+        .unwrap_or(0.0);
+
+    Some(VideoMeta { width, height, duration })
+}
+
+fn video_cache_dir(path: &Path) -> Option<PathBuf> {
+    let meta = std::fs::metadata(path).ok()?;
+    let mut hasher = DefaultHasher::new();
+    path.hash(&mut hasher);
+    mtime_secs(&meta).hash(&mut hasher);
+    meta.len().hash(&mut hasher);
+    VIDEO_FRAME_PX.hash(&mut hasher);
+    Some(cache_dir().join("video_frames").join(format!("{:016x}", hasher.finish())))
+}
+
+fn load_video_frames(dir: &Path) -> Option<Vec<egui::ColorImage>> {
+    let mut frames = Vec::with_capacity(3);
+    for i in 0..3 {
+        let img = image::open(dir.join(format!("{}.png", i))).ok()?.to_rgba8();
+        frames.push(egui::ColorImage::from_rgba_unmultiplied(
+            [img.width() as usize, img.height() as usize],
+            img.as_raw(),
+        ));
+    }
+    Some(frames)
+}
+
+static VIDEO_EXTRACT_COUNT: Mutex<usize> = Mutex::new(0);
+static VIDEO_EXTRACT_CV: Condvar = Condvar::new();
+
+struct VideoExtractSlot;
+
+impl Drop for VideoExtractSlot {
+    fn drop(&mut self) {
+        let mut count = VIDEO_EXTRACT_COUNT.lock().unwrap_or_else(|e| e.into_inner());
+        *count = count.saturating_sub(1);
+        VIDEO_EXTRACT_CV.notify_all();
+    }
+}
+
+fn acquire_video_extract_slot() -> VideoExtractSlot {
+    let mut count = VIDEO_EXTRACT_COUNT.lock().unwrap_or_else(|e| e.into_inner());
+    while *count >= MAX_VIDEO_EXTRACT {
+        count = VIDEO_EXTRACT_CV.wait(count).unwrap_or_else(|e| e.into_inner());
+    }
+    *count += 1;
+    VideoExtractSlot
+}
+
+fn extract_video_frames(path: &Path, dir: &Path, duration: Option<f64>) -> Option<Vec<egui::ColorImage>> {
+    let _slot = acquire_video_extract_slot();
+    std::fs::create_dir_all(dir).ok()?;
+    let scale = format!(
+        "scale={0}:{0}:force_original_aspect_ratio=decrease",
+        VIDEO_FRAME_PX
+    );
+
+    for (i, seconds) in video_sample_times(duration).iter().enumerate() {
+        let final_path = dir.join(format!("{}.png", i));
+        if final_path.exists() && image::open(&final_path).is_ok() {
+            continue;
+        }
+
+        let tmp = dir.join(format!("{}.tmp.png", i));
+        let status = Command::new("ffmpeg")
+            .arg("-hide_banner").arg("-loglevel").arg("error")
+            .arg("-ss").arg(format!("{:.3}", seconds))
+            .arg("-i").arg(path)
+            .arg("-frames:v").arg("1")
+            .arg("-an").arg("-sn").arg("-dn")
+            .arg("-vf").arg(&scale)
+            .arg("-y")
+            .arg("-update").arg("1")
+            .arg(&tmp)
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status()
+            .ok()?;
+        if !status.success() {
+            let _ = std::fs::remove_file(&tmp);
+            return None;
+        }
+        std::fs::rename(&tmp, &final_path).ok()?;
+    }
+
+    load_video_frames(dir)
+}
+
+fn make_video_thumb(path: &str, duration: Option<f64>) -> Option<(WorkerThumbContent, egui::ColorImage)> {
+    let path = Path::new(path);
+    let dir = video_cache_dir(path)?;
+    let frames = load_video_frames(&dir).or_else(|| extract_video_frames(path, &dir, duration))?;
+    if frames.len() != 3 {
+        return None;
+    }
+    let small = create_small_preview(&frames[1]);
+    Some((WorkerThumbContent::Animated { frames, durations: vec![0.5; 3] }, small))
+}
+
+/// Replace `path` with `text` only when the contents actually differ.
+///
+/// The index and sidecars are rewritten via a temp file + rename. Skipping an
+/// identical rewrite avoids needless mtime churn and stops the app from
+/// treating its own freshly replaced cache file as a change.
+fn write_index_if_changed(path: &Path, text: &str) -> std::io::Result<bool> {
+    if std::fs::read_to_string(path).map(|old| old == text).unwrap_or(false) {
+        return Ok(false);
+    }
+    let tmp = path.with_extension("tsv.tmp");
+    std::fs::write(&tmp, text)?;
+    std::fs::rename(&tmp, path)?;
+    Ok(true)
+}
+
+pub fn make_thumb(
+    path: &str,
+    px: [u32; 2],
+    duration: Option<f64>,
+) -> Option<(WorkerThumbContent, egui::ColorImage)> {
+    let ext = Path::new(path)
+        .extension()
+        .unwrap_or_default()
+        .to_string_lossy()
+        .to_lowercase();
+    if is_video_ext(&ext) {
+        return make_video_thumb(path, duration);
+    }
+
     let bytes = std::fs::read(path).ok()?;
 
-    if path.to_lowercase().ends_with(".webp") {
+    if ext == "webp" {
         if let Ok(decoder) = webp_animation::Decoder::new(&bytes) {
             let mut tex_frames = Vec::new();
             let mut timestamps_ms = Vec::new();
@@ -222,7 +459,7 @@ pub fn worker(shared: Arc<Shared>, tx: Sender<Msg>, ctx: egui::Context) {
         let msg = if !still_wanted {
             Msg::Skipped { path: job.path, px: job.px }
         } else {
-            match make_thumb(&job.path, job.px) {
+            match make_thumb(&job.path, job.px, job.duration) {
                 Some((content, small)) => Msg::Done { path: job.path, px: job.px, content, small: Arc::new(small) },
                 None => Msg::Failed { path: job.path },
             }
@@ -233,8 +470,50 @@ pub fn worker(shared: Arc<Shared>, tx: Sender<Msg>, ctx: egui::Context) {
 }
 
 // ---------------------------------------------------------------------------
-// Index cache (index.tsv) - 16 columns
+// Index cache (index.tsv) - 17 columns
 // ---------------------------------------------------------------------------
+
+/// Everything from a Sidecar that isn't derivable from the image file or the
+/// dedicated index columns. Stored as one JSON field so TSV stays simple.
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+struct SidecarExtra {
+    #[serde(default)] tag_parents: HashMap<String, String>,
+    #[serde(default)] artists: Vec<String>,
+    #[serde(default)] sources: Vec<Source>,
+    #[serde(default)] alt_text: String,
+    #[serde(default)] relationships: Vec<Relationship>,
+    #[serde(default)] properties: HashMap<String, String>,
+}
+
+impl SidecarExtra {
+    fn from_sidecar(sc: &Sidecar) -> Self {
+        Self {
+            tag_parents: sc.tag_parents.clone(),
+            artists: sc.artists.clone(),
+            sources: sc.sources.clone(),
+            alt_text: sc.alt_text.clone(),
+            relationships: sc.relationships.clone(),
+            properties: sc.properties.clone(),
+        }
+    }
+
+    fn apply_to(&self, sc: &mut Sidecar) {
+        sc.tag_parents = self.tag_parents.clone();
+        sc.artists = self.artists.clone();
+        sc.sources = self.sources.clone();
+        sc.alt_text = self.alt_text.clone();
+        sc.relationships = self.relationships.clone();
+        sc.properties = self.properties.clone();
+    }
+
+    fn encode(sc: &Sidecar) -> String {
+        serde_json::to_string(&Self::from_sidecar(sc)).unwrap_or_else(|_| "{}".into())
+    }
+
+    fn decode(s: &str) -> Self {
+        serde_json::from_str(s).unwrap_or_default()
+    }
+}
 
 struct IndexEntry {
     mtime: u64,
@@ -245,10 +524,24 @@ struct IndexEntry {
     analysis: Option<(Margins, BorderColors)>,
     rating: u8,
     tags: Vec<String>,
+    extra: SidecarExtra,
 }
 
 type Index = HashMap<String, IndexEntry>;
 type MarginJob = (String, u32, u32);
+
+/// Count indexed images directly inside each directory.
+///
+/// Used by the path bar to annotate sibling folders without rescanning disk.
+pub fn directory_counts(index_path: &Path) -> HashMap<PathBuf, usize> {
+    let mut counts = HashMap::new();
+    for path in load_index(index_path).keys() {
+        if let Some(parent) = Path::new(path).parent() {
+            *counts.entry(parent.to_path_buf()).or_insert(0) += 1;
+        }
+    }
+    counts
+}
 
 fn hex(c: Option<[u8; 4]>) -> String {
     match c {
@@ -274,10 +567,10 @@ fn load_index(path: &Path) -> Index {
     let mut version_ok = false;
     if let Some(first_line) = text.lines().next() {
         if let Some(v) = first_line.strip_prefix('#') {
-            version_ok = v.trim() == ANALYSIS_VERSION;
+            version_ok = v.trim() == INDEX_VERSION;
             if !version_ok {
                 eprintln!("gallery: index version mismatch ('{}' vs '{}') — cache invalidated",
-                          v.trim(), ANALYSIS_VERSION);
+                          v.trim(), INDEX_VERSION);
             }
         }
     }
@@ -287,7 +580,7 @@ fn load_index(path: &Path) -> Index {
 
     for line in text.lines().skip(1) {
         let f: Vec<&str> = line.split('\t').collect();
-        if f.len() != 16 { continue; }
+        if f.len() < 17 { continue; }
         if let (Ok(m), Ok(l), Ok(w), Ok(h), Ok(r)) = (
             f[1].parse(), f[2].parse(), f[4].parse(), f[5].parse(), f[14].parse()
         ) {
@@ -307,37 +600,36 @@ fn load_index(path: &Path) -> Index {
             let tags = if f[15] == "-" { Vec::new() } else { f[15].split('|').map(|s| s.to_string()).collect() };
 
             idx.insert(f[0].to_string(), IndexEntry {
-                mtime: m, len: l, is_animated, w, h, analysis, rating: r, tags
+                mtime: m, len: l, is_animated, w, h, analysis, rating: r, tags,
+                extra: SidecarExtra::decode(f[16]),
             });
         }
     }
     idx
 }
 
-pub fn update_index_entry(index_path: &Path, image_path: &str, tags: &[String], rating: u8) {
+pub fn update_index_entry(index_path: &Path, image_path: &str, sc: &Sidecar) {
     let Ok(text) = std::fs::read_to_string(index_path) else { return };
     let mut out = String::with_capacity(text.len() + 100);
     let mut found = false;
     for line in text.lines() {
         if line.starts_with('#') { out.push_str(line); out.push('\n'); continue; }
         let f: Vec<&str> = line.split('\t').collect();
-        if f.len() != 16 || f[0] != image_path {
+        if f.len() < 16 || f[0] != image_path {
             out.push_str(line);
             out.push('\n');
             continue;
         }
-        let tags_str = if tags.is_empty() { "-".to_string() } else { tags.join("|") };
+        let tags_str = if sc.tags.is_empty() { "-".to_string() } else { sc.tags.join("|") };
         out.push_str(&format!(
-            "{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\n",
-            f[0], f[1], f[2], f[3], f[4], f[5], f[6], f[7], f[8], f[9], f[10], f[11], f[12], f[13], rating, tags_str
+            "{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\n",
+            f[0], f[1], f[2], f[3], f[4], f[5], f[6], f[7], f[8], f[9], f[10], f[11], f[12], f[13],
+            sc.rating, tags_str, SidecarExtra::encode(sc)
         ));
         found = true;
     }
     if !found { return; }
-    let tmp = index_path.with_extension("tsv.tmp");
-    if std::fs::write(&tmp, out).is_ok() {
-        let _ = std::fs::rename(&tmp, index_path);
-    }
+    let _ = write_index_if_changed(index_path, &out);
 }
 
 // ---------------------------------------------------------------------------
@@ -418,7 +710,7 @@ pub fn scan_worker(
     .clamp(4, 16);
     let chunk_size = (total_est + n_threads - 1) / n_threads;
 
-    let mut all_index_lines = String::from(format!("#{ANALYSIS_VERSION}\n"));
+    let mut all_index_lines = format!("#{INDEX_VERSION}\n");
     let mut all_margin_jobs = Vec::new();
     let mut json_loaded = 0usize;
     let mut cache_hits = 0usize;
@@ -504,6 +796,7 @@ pub fn scan_worker(
                                     sc.margins = Some(*m);
                                     sc.border_colors = Some(c.clone());
                                 }
+                                e.extra.apply_to(&mut sc);
                                 local_hits += 1;
                                 hits_counter.fetch_add(1, Ordering::Relaxed);
                                 (sc, true)
@@ -519,19 +812,6 @@ pub fn scan_worker(
                                 return;
                             }
 
-                            if VIDEO_EXTS.contains(&ext.as_str()) {
-                                batch.push(GalleryItem {
-                                    id: path_str.clone(), title, path: path_str,
-                                           is_folder: false, ext, aspect_ratio: 16.0 / 9.0,
-                                           is_animated: false, width: 1920.0, height: 1080.0,
-                                           border_colors: BorderColors::default(),
-                                           margins: Margins::default(),
-                                           rating: 0, tags: HashSet::new(), sidecar: Sidecar::default(),
-                                });
-                                if batch.len() >= BATCH_SIZE { flush(&mut batch, &tx, &ctx); }
-                                return;
-                            }
-
                             let stem = path.file_stem().map(|s| s.to_string_lossy().to_string()).unwrap_or_default();
                             if sidecar_stems.contains(&stem) {
                                 if let Some((sc, src)) = Sidecar::load_with_source(Path::new(&path_str)) {
@@ -544,6 +824,31 @@ pub fn scan_worker(
                             }
                         }
 
+                        // Videos share the normal sidecar/index path so ratings,
+                        // tags and metadata survive warm launches. Probe only when
+                        // the cache cannot supply dimensions/duration.
+                        if is_video_ext(&ext) {
+                            sidecar.is_animated = Some(true);
+                            if !from_cache
+                                && (sidecar.width.is_none()
+                                    || sidecar.height.is_none()
+                                    || video_duration(&sidecar).is_none())
+                            {
+                                if let Some(meta) = probe_video(&path) {
+                                    if sidecar.width.is_none() { sidecar.width = Some(meta.width); }
+                                    if sidecar.height.is_none() { sidecar.height = Some(meta.height); }
+                                    if video_duration(&sidecar).is_none() && meta.duration > 0.0 {
+                                        sidecar.properties.insert(
+                                            VIDEO_DURATION_PROPERTY.to_string(),
+                                            meta.duration.to_string(),
+                                        );
+                                    }
+                                }
+                            }
+                            if sidecar.width.is_none() { sidecar.width = Some(1920); }
+                            if sidecar.height.is_none() { sidecar.height = Some(1080); }
+                        }
+
                         let mut sidecar_dirty = false;
 
                         let dims: Option<(u32, u32)> = if let (Some(w), Some(h)) = (sidecar.width, sidecar.height) {
@@ -551,7 +856,7 @@ pub fn scan_worker(
                         } else {
                             match old.get(&path_str) {
                                 Some(e) if e.mtime == mtime && e.len == len => Some((e.w, e.h)),
-                                                                                  _ => image::image_dimensions(&path).ok(),
+                                                                                  _ => image_dimensions(&path),
                             }
                         };
                         let Some((w, h)) = dims else { return };
@@ -600,25 +905,26 @@ pub fn scan_worker(
 
                         if !path_str.contains('\t') && !path_str.contains('\n') {
                             let tags_str = if sidecar.tags.is_empty() { "-".to_string() } else { sidecar.tags.join("|") };
+                            let extra_str = SidecarExtra::encode(&sidecar);
                             if has_cached_analysis {
                                 local_index.push_str(&format!(
-                                    "{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\n",
+                                    "{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\n",
                                     path_str, mtime, len,
                                     if is_animated { 1 } else { 0 },
                                         w, h,
                                         margins.top, margins.bottom, margins.left, margins.right,
                                         hex(border_colors.top), hex(border_colors.bottom), hex(border_colors.left), hex(border_colors.right),
-                                                              rating, tags_str
+                                                              rating, tags_str, extra_str
                                 ));
                             } else {
                                 // Sentinel: "never analyzed" — will be filled in by Phase 3
                                 local_index.push_str(&format!(
-                                    "{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t-\t-\t-\t-\t{}\t{}\n",
+                                    "{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t-\t-\t-\t-\t{}\t{}\t{}\n",
                                     path_str, mtime, len,
                                     if is_animated { 1 } else { 0 },
                                         w, h,
                                         NO_MARGIN_SENTINEL, NO_MARGIN_SENTINEL, NO_MARGIN_SENTINEL, NO_MARGIN_SENTINEL,
-                                        rating, tags_str
+                                        rating, tags_str, extra_str
                                 ));
                             }
                         }
@@ -651,9 +957,11 @@ pub fn scan_worker(
         }
     });
 
-    let tmp = index_path.with_extension("tsv.tmp");
-    if std::fs::write(&tmp, &all_index_lines).is_ok() {
-        let _ = std::fs::rename(&tmp, &index_path);
+    if let Some(parent) = index_path.parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
+    if let Err(e) = write_index_if_changed(&index_path, &all_index_lines) {
+        eprintln!("gallery: [phase 1] ERROR writing index: {}", e);
     }
 
     let p1_elapsed = phase1_start.elapsed().as_secs_f64();
@@ -753,7 +1061,7 @@ fn spawn_margin_workers(
         for line in text.lines() {
             if line.starts_with('#') { out.push_str(line); out.push('\n'); continue; }
             let f: Vec<&str> = line.split('\t').collect();
-            if f.len() < 16 {
+            if f.len() < 17 {
                 out.push_str(line);
                 out.push('\n');
                 continue;
@@ -761,11 +1069,11 @@ fn spawn_margin_workers(
             let path = f[0];
             if let Some((m, c)) = results.get(path) {
                 out.push_str(&format!(
-                    "{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\n",
+                    "{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\n",
                     path, f[1], f[2], f[3], f[4], f[5],
                     m.top, m.bottom, m.left, m.right,
                     hex(c.top), hex(c.bottom), hex(c.left), hex(c.right),
-                                      f[14], f[15]
+                                      f[14], f[15], f[16]
                 ));
                 merged += 1;
             } else {
@@ -774,16 +1082,11 @@ fn spawn_margin_workers(
             }
         }
 
-        let tmp = index_path.with_extension("tsv.tmp");
-        match std::fs::write(&tmp, out) {
-            Ok(()) => {
-                if std::fs::rename(&tmp, &index_path).is_ok() {
-                    eprintln!("gallery: [phase 3] ✅ complete in {:.2}s ({} entries updated)",
-                              p3_start.elapsed().as_secs_f64(), merged);
-                } else {
-                    eprintln!("gallery: [phase 3] ERROR — rename failed");
-                }
-            }
+        match write_index_if_changed(&index_path, &out) {
+            Ok(true) => eprintln!("gallery: [phase 3] ✅ complete in {:.2}s ({} entries updated)",
+                                  p3_start.elapsed().as_secs_f64(), merged),
+            Ok(false) => eprintln!("gallery: [phase 3] ✅ no changes in {:.2}s ({} entries already current)",
+                                   p3_start.elapsed().as_secs_f64(), merged),
             Err(e) => eprintln!("gallery: [phase 3] ERROR — write failed: {}", e),
         }
 
@@ -795,4 +1098,145 @@ fn spawn_margin_workers(
         eprintln!("gallery: ═══════════════════════════════════════════════════");
         ctx3.request_repaint();
     });
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn recognises_common_video_extensions() {
+        assert!(is_video_ext("mp4"));
+        assert!(is_video_ext("WEBM"));
+        assert!(is_video_path(Path::new("/tmp/clip.MKV")));
+        assert!(!is_video_ext("webp"));
+    }
+
+    #[test]
+    fn video_samples_are_spread_across_the_clip() {
+        let times = video_sample_times(Some(20.0));
+        assert_eq!(times, [2.0, 10.0, 18.0]);
+        assert_eq!(video_sample_times(None), [1.0, 5.0, 9.0]);
+    }
+
+    #[test]
+    fn formats_video_duration() {
+        assert_eq!(format_duration(Some(75.0)), "1:15");
+        assert_eq!(format_duration(None), "VIDEO");
+    }
+
+    #[test]
+    fn index_round_trips_full_sidecar() {
+        let mut sc = Sidecar::default();
+        sc.tags = vec!["fox".into(), "animal".into()];
+        sc.rating = 3;
+        sc.artists = vec!["somebody".into()];
+        sc.alt_text = "a fox with a tab\tand newline\n".into();
+        sc.tag_parents.insert("fox".into(), "animal".into());
+        sc.properties.insert("key".into(), "value".into());
+        sc.sources.push(Source { url: "https://example.com".into(), ..Source::default() });
+        sc.relationships.push(Relationship {
+            subject: "fox".into(), predicate: "holding".into(), object: "plush".into(),
+        });
+
+        let line = format!(
+            "#{}\n/tmp/a.webp\t1\t2\t0\t10\t20\t0\t0\t0\t0\t-\t-\t-\t-\t{}\t{}\t{}\n",
+            INDEX_VERSION,
+            sc.rating,
+            sc.tags.join("|"),
+            SidecarExtra::encode(&sc),
+        );
+        let dir = std::env::temp_dir().join("symtropy-index-test");
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("index.tsv");
+        std::fs::write(&path, line).unwrap();
+
+        let idx = load_index(&path);
+        let e = idx.get("/tmp/a.webp").expect("entry parsed");
+        assert_eq!(e.rating, 3);
+        assert_eq!(e.tags, sc.tags);
+
+        let mut restored = Sidecar::default();
+        e.extra.apply_to(&mut restored);
+        assert_eq!(restored.artists, sc.artists);
+        assert_eq!(restored.alt_text, sc.alt_text);
+        assert_eq!(restored.tag_parents, sc.tag_parents);
+        assert_eq!(restored.properties, sc.properties);
+        assert_eq!(restored.sources.len(), 1);
+        assert_eq!(restored.relationships.len(), 1);
+    }
+
+    #[test]
+    fn rejects_stale_index_version() {
+        let dir = std::env::temp_dir().join("symtropy-index-test-old");
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("index.tsv");
+        std::fs::write(&path, "#margins-v5\n/tmp/a.webp\t1\t2\t0\t10\t20\t0\t0\t0\t0\t-\t-\t-\t-\t0\t-\t{}\n").unwrap();
+        assert!(load_index(&path).is_empty());
+    }
+
+    fn scratch(name: &str) -> std::path::PathBuf {
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let dir = std::env::temp_dir().join(format!("symtropy-cache-{}-{}", name, nanos));
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    #[test]
+    fn identical_index_rewrite_is_skipped() {
+        let dir = scratch("rewrite");
+        let path = dir.join("index.tsv");
+        let text = format!("#{}\n/tmp/a.webp\t1\t2\t0\t10\t20\t0\t0\t0\t0\t-\t-\t-\t-\t0\t-\t{{}}\n", INDEX_VERSION);
+
+        assert!(write_index_if_changed(&path, &text).unwrap());
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), text);
+        assert!(!write_index_if_changed(&path, &text).unwrap());
+
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn metadata_update_preserves_cached_margins() {
+        let dir = scratch("metadata");
+        let path = dir.join("index.tsv");
+        let original = format!(
+            "#{}\n/tmp/a.webp\t1\t2\t0\t10\t20\t3\t4\t5\t6\t-\t-\t-\t-\t0\told\t{{}}\n",
+            INDEX_VERSION
+        );
+        std::fs::write(&path, original).unwrap();
+
+        let mut sc = Sidecar::default();
+        sc.tags = vec!["new".into()];
+        sc.rating = 4;
+        sc.alt_text = "updated".into();
+        update_index_entry(&path, "/tmp/a.webp", &sc);
+
+        let idx = load_index(&path);
+        let e = idx.get("/tmp/a.webp").expect("entry preserved");
+        let (m, _) = e.analysis.as_ref().expect("analysis preserved");
+        assert_eq!((m.top, m.bottom, m.left, m.right), (3, 4, 5, 6));
+        assert_eq!(e.tags, sc.tags);
+        assert_eq!(e.rating, 4);
+        assert_eq!(e.extra.alt_text, "updated");
+
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn dimensions_are_sniffed_from_file_contents() {
+        let dir = scratch("dims");
+        let png = dir.join("photo.png");
+        let path = dir.join("photo.jpg%3Alarge");
+        image::RgbaImage::from_pixel(7, 5, image::Rgba([1, 2, 3, 255]))
+            .save(&png)
+            .unwrap();
+        std::fs::rename(&png, &path).unwrap();
+
+        assert_eq!(image_dimensions(&path), Some((7, 5)));
+
+        std::fs::remove_dir_all(dir).unwrap();
+    }
 }

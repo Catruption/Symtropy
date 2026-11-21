@@ -2,8 +2,8 @@
 //!
 //! * `_GTK_FRAME_EXTENTS`: tells the WM the transparent overhang band around the plate is invisible
 //!   client-side shadow, so it tiles/snaps/maximizes the *plate* and grows the real window outward.
-//! * XShape input region: only the plate (and the window buttons, which sit in the overhang) receive
-//!   mouse input. Clicks anywhere else in the transparent band fall through to windows underneath.
+//! * XShape input region: the plate (including the gutter sliders) and the window buttons, which sit
+//!   in the overhang, receive mouse input. Clicks anywhere else in the transparent band fall through.
 
 use x11rb::connection::Connection;
 use x11rb::protocol::shape::{ConnectionExt as _, SK, SO};

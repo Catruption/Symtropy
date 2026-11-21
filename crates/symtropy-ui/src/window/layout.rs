@@ -43,9 +43,13 @@ pub fn compute(plate: Rect, theme: &Theme) -> Layout {
 
     // Controls: positioned relative to the FRAME; buttons overlap by `overlap`.
     let k = &c.controls;
-    let (size, overlap) = (k.size * s, k.overlap * s);
+    let bs = theme.button_scale();
+    let (size, overlap) = (k.size * bs, k.overlap * bs);
     let total = size * 3.0 - overlap * 2.0;
-    let origin = align_rect(win, vec2(total, size), &k.position, vec2(k.offset_x, k.offset_y) * s).min;
+    // The theme's button offsets are relative to the full texture frame. Convert them to
+    // plate-relative offsets so changing the corner scale never pushes the buttons off-screen.
+    let button_offset = vec2(k.offset_x * theme.decor_scale() + side, k.offset_y * theme.decor_scale() - side);
+    let origin = align_rect(plate, vec2(total, size), &k.position, button_offset).min;
     let step = size - overlap;
     let buttons = [0, 1, 2].map(|i| Rect::from_min_size(origin + vec2(step * i as f32, 0.0), Vec2::splat(size)));
 

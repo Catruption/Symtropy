@@ -2,12 +2,13 @@ use egui::TextureHandle;
 use std::collections::hash_map::DefaultHasher;
 use std::collections::{HashMap, HashSet};
 use std::hash::{Hash, Hasher};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::AtomicUsize;
 use std::sync::mpsc::{channel, Receiver};
 use std::sync::Arc;
-use std::time::Instant;
+use std::time::{Instant, UNIX_EPOCH};
 
+use crate::file_manager::{compare_sortable, SortDirection, SortKey, SortableEntry};
 use crate::filter::FilterPass;
 
 pub mod hierarchy;
@@ -156,7 +157,13 @@ pub struct GalleryState {
     pub(crate) anim_start: HashMap<String, f64>,
 
     pub grid_scale: f32,
+    pub scroll_offset: f32,
+    pub sort_key: SortKey,
+    pub sort_direction: SortDirection,
     pub selected_images: Vec<String>,
+    pub selection_anchor: Option<String>,
+    /// Item addressed by keyboard navigation (independent of the range anchor).
+    pub keyboard_focus: Option<String>,
     pub request_open_viewer: bool,
     pub viewer_target: Option<String>,
     pub tag_tree: TagNode,
@@ -174,6 +181,17 @@ pub struct GalleryState {
 }
 
 impl GalleryState {
+    /// Paths currently visible under the active query, in display order. Used by the
+    /// slideshow so it follows the same filters as the gallery.
+    pub fn visible_paths(&self) -> Vec<String> {
+        self.items
+            .iter()
+            .filter(|item| !item.is_folder)
+            .filter(|item| self.active_query.matches(&item.tags, item.rating, &self.hierarchy))
+            .map(|item| item.path.clone())
+            .collect()
+    }
+
     pub fn scan_dir(ctx: &egui::Context, dir: &Path) -> Self {
         let tags_path = dir
         .parent()
@@ -237,7 +255,12 @@ impl GalleryState {
             layout_cache: None,
             anim_start: HashMap::new(),
             grid_scale: 1.0,
+            scroll_offset: 0.0,
+            sort_key: SortKey::default(),
+            sort_direction: SortKey::default().default_direction(),
             selected_images: Vec::new(),
+            selection_anchor: None,
+            keyboard_focus: None,
             request_open_viewer: false,
             viewer_target: None,
             tag_tree,
@@ -251,6 +274,64 @@ impl GalleryState {
             wanted_now: HashMap::new(),
             new_jobs: Vec::new(),
         }
+    }
+
+    /// Store and apply the shared list/gallery sort order.
+    pub fn set_sort(&mut self, sort: SortKey, direction: SortDirection) {
+        self.sort_key = sort;
+        self.sort_direction = direction;
+        self.sort_items();
+    }
+
+    /// Reorder the gallery with the same smart grouping used by the file list.
+    pub fn sort_items(&mut self) {
+        let sort = self.sort_key;
+        let direction = self.sort_direction;
+        let meta: HashMap<String, (u64, i64)> = self
+            .items
+            .iter()
+            .map(|item| {
+                let path = PathBuf::from(&item.path);
+                let key = std::fs::metadata(&path)
+                    .map(|m| {
+                        let date = m
+                            .modified()
+                            .ok()
+                            .and_then(|t| t.duration_since(UNIX_EPOCH).ok())
+                            .map(|d| d.as_secs() as i64)
+                            .unwrap_or(0);
+                        (m.len(), date)
+                    })
+                    .unwrap_or((0, 0));
+                (item.path.clone(), key)
+            })
+            .collect();
+
+        self.items.sort_by(|a, b| {
+            let (a_len, a_date) = meta.get(&a.path).copied().unwrap_or((0, 0));
+            let (b_len, b_date) = meta.get(&b.path).copied().unwrap_or((0, 0));
+            compare_sortable(
+                &SortableEntry {
+                    path: PathBuf::from(&a.path),
+                    name: a.title.clone(),
+                    is_dir: a.is_folder,
+                    rating: a.rating,
+                    len: a_len,
+                    date: a_date,
+                },
+                &SortableEntry {
+                    path: PathBuf::from(&b.path),
+                    name: b.title.clone(),
+                    is_dir: b.is_folder,
+                    rating: b.rating,
+                    len: b_len,
+                    date: b_date,
+                },
+                sort,
+                direction,
+            )
+        });
+        self.layout_cache = None;
     }
 
     pub(crate) fn poll(&mut self, ctx: &egui::Context) {
@@ -279,12 +360,7 @@ impl GalleryState {
                 }
                 Ok(ScanMsg::Done) => {
                     self.scanning = false;
-                    self.items.sort_by(|a, b| {
-                        b.is_folder.cmp(&a.is_folder)
-                        .then_with(|| (b.width * b.height).partial_cmp(&(a.width * a.height)).unwrap_or(std::cmp::Ordering::Equal))
-                        .then_with(|| a.title.to_lowercase().cmp(&b.title.to_lowercase()))
-                    });
-                    self.layout_cache = None;
+                    self.sort_items();
                     ctx.request_repaint();
                 }
                 Err(_) => break,
@@ -332,12 +408,12 @@ impl GalleryState {
         }
     }
 
-    pub(crate) fn want(&mut self, path: &str, px: [u32; 2]) {
+    pub(crate) fn want(&mut self, path: &str, px: [u32; 2], video_duration: Option<f64>) {
         self.wanted_now.insert(path.to_string(), px);
         let have = self.thumbs.get(path).map(|t| t.px == px).unwrap_or(false);
         if !have && self.inflight.get(path) != Some(&px) {
             self.inflight.insert(path.to_string(), px);
-            self.new_jobs.push(workers::Job { path: path.to_string(), px });
+            self.new_jobs.push(workers::Job { path: path.to_string(), px, duration: video_duration });
         }
     }
 
