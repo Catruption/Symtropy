@@ -2,7 +2,7 @@ use super::sidecar::{LoadSource, Relationship, Sidecar, Source};
 use super::*;
 use serde::{Deserialize, Serialize};
 use std::collections::hash_map::DefaultHasher;
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::hash::{Hash, Hasher};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
@@ -47,7 +47,7 @@ pub enum WorkerThumbContent {
 }
 
 pub enum Msg {
-    Done { path: String, px: [u32; 2], content: WorkerThumbContent, small: Arc<egui::ColorImage> },
+    Done { path: String, px: [u32; 2], content: WorkerThumbContent },
     Skipped { path: String, px: [u32; 2] },
     Failed { path: String },
 }
@@ -257,15 +257,14 @@ fn extract_video_frames(path: &Path, dir: &Path, duration: Option<f64>) -> Optio
     load_video_frames(dir)
 }
 
-fn make_video_thumb(path: &str, duration: Option<f64>) -> Option<(WorkerThumbContent, egui::ColorImage)> {
+fn make_video_thumb(path: &str, duration: Option<f64>) -> Option<WorkerThumbContent> {
     let path = Path::new(path);
     let dir = video_cache_dir(path)?;
     let frames = load_video_frames(&dir).or_else(|| extract_video_frames(path, &dir, duration))?;
     if frames.len() != 3 {
         return None;
     }
-    let small = create_small_preview(&frames[1]);
-    Some((WorkerThumbContent::Animated { frames, durations: vec![0.5; 3] }, small))
+    Some(WorkerThumbContent::Animated { frames, durations: vec![0.5; 3] })
 }
 
 /// Replace `path` with `text` only when the contents actually differ.
@@ -287,7 +286,7 @@ pub fn make_thumb(
     path: &str,
     px: [u32; 2],
     duration: Option<f64>,
-) -> Option<(WorkerThumbContent, egui::ColorImage)> {
+) -> Option<WorkerThumbContent> {
     let ext = Path::new(path)
         .extension()
         .unwrap_or_default()
@@ -327,8 +326,7 @@ pub fn make_thumb(
                     if i == timestamps_ms.len() - 1 && dur_ms <= 0.0 { dur_ms = 100.0; }
                     durations.push(if dur_ms <= 0.0 { 0.05 } else { dur_ms / 1000.0 });
                 }
-                let small_ci = create_small_preview(&tex_frames[0]);
-                return Some((WorkerThumbContent::Animated { frames: tex_frames, durations }, small_ci));
+                return Some(WorkerThumbContent::Animated { frames: tex_frames, durations });
             }
         }
     }
@@ -344,20 +342,7 @@ pub fn make_thumb(
     };
     let size = [resized.width() as usize, resized.height() as usize];
     let ci = egui::ColorImage::from_rgba_unmultiplied(size, resized.as_raw());
-    let small_ci = create_small_preview(&ci);
-    Some((WorkerThumbContent::Static(ci), small_ci))
-}
-
-fn create_small_preview(img: &egui::ColorImage) -> egui::ColorImage {
-    let k = SMALL_MAX / img.width().max(img.height()) as f32;
-    let sw = ((img.width() as f32 * k).round() as u32).max(1);
-    let sh = ((img.height() as f32 * k).round() as u32).max(1);
-    let raw = image::RgbaImage::from_raw(img.width() as u32, img.height() as u32, img.as_raw().to_vec()).unwrap();
-    let small = image::imageops::thumbnail(&raw, sw, sh);
-    egui::ColorImage::from_rgba_unmultiplied(
-        [small.width() as usize, small.height() as usize],
-                                             small.as_raw(),
-    )
+    Some(WorkerThumbContent::Static(ci))
 }
 
 fn same_colour(a: [u8; 4], b: [u8; 4]) -> bool {
@@ -460,7 +445,7 @@ pub fn worker(shared: Arc<Shared>, tx: Sender<Msg>, ctx: egui::Context) {
             Msg::Skipped { path: job.path, px: job.px }
         } else {
             match make_thumb(&job.path, job.px, job.duration) {
-                Some((content, small)) => Msg::Done { path: job.path, px: job.px, content, small: Arc::new(small) },
+                Some(content) => Msg::Done { path: job.path, px: job.px, content },
                 None => Msg::Failed { path: job.path },
             }
         };
@@ -530,6 +515,12 @@ struct IndexEntry {
 type Index = HashMap<String, IndexEntry>;
 type MarginJob = (String, u32, u32);
 
+/// The index is global (one file for the whole library). Folder scans, margin
+/// merges and UI edits can all be in flight at once, so every read-modify-write
+/// cycle must be serialized. Otherwise a later writer can restore a stale
+/// snapshot and silently wipe another folder's cached rows.
+static INDEX_LOCK: Mutex<()> = Mutex::new(());
+
 /// Count indexed images directly inside each directory.
 ///
 /// Used by the path bar to annotate sibling folders without rescanning disk.
@@ -557,27 +548,12 @@ fn unhex(s: &str) -> Option<Option<[u8; 4]>> {
     Some(Some(v.to_be_bytes()))
 }
 
-fn load_index(path: &Path) -> Index {
+fn version_from_text(text: &str) -> Option<&str> {
+    text.lines().next()?.strip_prefix('#').map(str::trim)
+}
+
+fn parse_index_text(text: &str) -> Index {
     let mut idx = Index::new();
-    let Ok(text) = std::fs::read_to_string(path) else {
-        eprintln!("gallery: no index.tsv found — cold start");
-        return idx;
-    };
-
-    let mut version_ok = false;
-    if let Some(first_line) = text.lines().next() {
-        if let Some(v) = first_line.strip_prefix('#') {
-            version_ok = v.trim() == INDEX_VERSION;
-            if !version_ok {
-                eprintln!("gallery: index version mismatch ('{}' vs '{}') — cache invalidated",
-                          v.trim(), INDEX_VERSION);
-            }
-        }
-    }
-    if !version_ok {
-        return idx;
-    }
-
     for line in text.lines().skip(1) {
         let f: Vec<&str> = line.split('\t').collect();
         if f.len() < 17 { continue; }
@@ -608,28 +584,216 @@ fn load_index(path: &Path) -> Index {
     idx
 }
 
-pub fn update_index_entry(index_path: &Path, image_path: &str, sc: &Sidecar) {
-    let Ok(text) = std::fs::read_to_string(index_path) else { return };
-    let mut out = String::with_capacity(text.len() + 100);
-    let mut found = false;
-    for line in text.lines() {
-        if line.starts_with('#') { out.push_str(line); out.push('\n'); continue; }
-        let f: Vec<&str> = line.split('\t').collect();
-        if f.len() < 16 || f[0] != image_path {
-            out.push_str(line);
-            out.push('\n');
+/// Load the cache and keep the raw text. The raw rows are needed when a scan
+/// finishes so rows for folders that were not scanned can be preserved.
+fn load_index_with_text(path: &Path) -> (Index, String) {
+    let Ok(text) = std::fs::read_to_string(path) else {
+        eprintln!("gallery: no index.tsv found — cold start");
+        return (Index::new(), String::new());
+    };
+
+    let version = version_from_text(&text);
+    if version != Some(INDEX_VERSION) {
+        if let Some(v) = version {
+            eprintln!("gallery: index version mismatch ('{}' vs '{}') — cache invalidated",
+                      v, INDEX_VERSION);
+        }
+        return (Index::new(), String::new());
+    }
+
+    (parse_index_text(&text), text)
+}
+
+fn load_index(path: &Path) -> Index {
+    load_index_with_text(path).0
+}
+
+/// Apply a change to the global index under a single lock.
+///
+/// `None` means "nothing to write"; `Some` is written only when byte-different.
+fn mutate_index<F>(path: &Path, mutate: F) -> std::io::Result<bool>
+where
+    F: FnOnce(&str) -> Option<String>,
+{
+    let _guard = INDEX_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let text = std::fs::read_to_string(path).unwrap_or_default();
+    let Some(next) = mutate(&text) else { return Ok(false) };
+    write_index_if_changed(path, &next)
+}
+
+/// Merge freshly scanned rows for `dir` into the current global index.
+///
+/// Rows for other directories are kept verbatim, so opening a small or empty
+/// folder can never wipe the cached metadata for the rest of the library. Rows
+/// previously stored for `dir` but not produced by this scan are dropped, so
+/// deleted files still leave the cache.
+fn merge_index_rows(old_text: &str, dir: &Path, scanned_rows: &str) -> String {
+    let mut out = String::with_capacity(old_text.len() + scanned_rows.len());
+    out.push('#');
+    out.push_str(INDEX_VERSION);
+    out.push('\n');
+
+    let mut seen: HashSet<String> = HashSet::new();
+    for line in scanned_rows.lines().skip(1) {
+        let Some(path) = line.split('\t').next() else { continue };
+        if path.is_empty() || !seen.insert(path.to_string()) {
             continue;
         }
-        let tags_str = if sc.tags.is_empty() { "-".to_string() } else { sc.tags.join("|") };
-        out.push_str(&format!(
-            "{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\n",
-            f[0], f[1], f[2], f[3], f[4], f[5], f[6], f[7], f[8], f[9], f[10], f[11], f[12], f[13],
-            sc.rating, tags_str, SidecarExtra::encode(sc)
-        ));
-        found = true;
+        out.push_str(line);
+        out.push('\n');
     }
-    if !found { return; }
-    let _ = write_index_if_changed(index_path, &out);
+
+    for line in old_text.lines().skip(1) {
+        let Some(path) = line.split('\t').next() else { continue };
+        if path.is_empty() || seen.contains(path) {
+            continue;
+        }
+        // Stale rows for the folder just scanned are intentionally discarded.
+        // A sibling with a matching string prefix (e.g. `library2`) is not.
+        if Path::new(path).starts_with(dir) {
+            continue;
+        }
+        seen.insert(path.to_string());
+        out.push_str(line);
+        out.push('\n');
+    }
+    out
+}
+
+fn write_scanned_index_rows(
+    path: &Path,
+    dir: &Path,
+    scanned_rows: &str,
+) -> std::io::Result<bool> {
+    mutate_index(path, |old_text| {
+        Some(merge_index_rows(old_text, dir, scanned_rows))
+    })
+}
+
+fn index_line_with_sidecar(line: &str, sc: &Sidecar) -> Option<String> {
+    let f: Vec<&str> = line.split('\t').collect();
+    if f.len() < 16 {
+        return None;
+    }
+    let tags_str = if sc.tags.is_empty() { "-".to_string() } else { sc.tags.join("|") };
+    Some(format!(
+        "{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\n",
+        f[0], f[1], f[2], f[3], f[4], f[5], f[6], f[7], f[8], f[9], f[10], f[11], f[12], f[13],
+        sc.rating, tags_str, SidecarExtra::encode(sc)
+    ))
+}
+
+pub fn update_index_entry(index_path: &Path, image_path: &str, sc: &Sidecar) {
+    let _ = mutate_index(index_path, |text| {
+        let mut out = String::with_capacity(text.len() + 100);
+        let mut found = false;
+        for line in text.lines() {
+            if line.starts_with('#') { out.push_str(line); out.push('\n'); continue; }
+            let is_target = line.split('\t').next() == Some(image_path);
+            if !is_target {
+                out.push_str(line);
+                out.push('\n');
+                continue;
+            }
+            if let Some(rewritten) = index_line_with_sidecar(line, sc) {
+                out.push_str(&rewritten);
+                found = true;
+            } else {
+                out.push_str(line);
+                out.push('\n');
+            }
+        }
+        found.then_some(out)
+    });
+}
+
+fn collect_sidecar_files(root: &Path, out: &mut Vec<PathBuf>) {
+    let skip_dirs = ["replace", ".git", "target", "node_modules", ".cache"];
+    let mut stack = vec![root.to_path_buf()];
+    while let Some(dir) = stack.pop() {
+        let Ok(entries) = std::fs::read_dir(&dir) else { continue };
+        for entry in entries.flatten() {
+            let Ok(kind) = entry.file_type() else { continue };
+            if kind.is_symlink() {
+                continue;
+            }
+            let path = entry.path();
+            if kind.is_dir() {
+                let name = entry.file_name().to_string_lossy().to_string();
+                if !skip_dirs.iter().any(|skip| name == *skip) {
+                    stack.push(path);
+                }
+            } else if kind.is_file()
+                && path.file_name().map_or(false, |n| n.to_string_lossy().ends_with(".halo.json"))
+            {
+                out.push(path);
+            }
+        }
+    }
+}
+
+fn image_path_for_sidecar(sidecar: &Path) -> Option<String> {
+    let name = sidecar.file_name()?.to_string_lossy();
+    let stem = name.strip_prefix('.')?.strip_suffix(".halo.json")?;
+    let parent = sidecar.parent()?;
+    let image = std::fs::read_dir(parent).ok()?.flatten().find_map(|entry| {
+        let path = entry.path();
+        let matches = path.is_file()
+            && path.file_stem().map_or(false, |s| s.to_string_lossy() == stem)
+            && !path.to_string_lossy().ends_with(".halo.json");
+        matches.then(|| path.to_string_lossy().into_owned())
+    })?;
+    Some(image)
+}
+
+/// Apply a tag mutation to every halo sidecar under `root` and update the
+/// matching index rows once. Used by taxonomy operations, which must survive a
+/// warm launch even for folders that are not currently open.
+pub fn rewrite_tag_metadata<F>(root: &Path, index_path: &Path, transform: F) -> usize
+where
+    F: Fn(&mut Sidecar) -> bool,
+{
+    let mut sidecars = Vec::new();
+    collect_sidecar_files(root, &mut sidecars);
+    let mut changed = 0;
+    let mut rewrites: HashMap<String, Sidecar> = HashMap::new();
+    for path in sidecars {
+        let Ok(text) = std::fs::read_to_string(&path) else { continue };
+        let Ok(mut sc) = serde_json::from_str::<Sidecar>(&text) else { continue };
+        if !transform(&mut sc) {
+            continue;
+        }
+        if sc.save_to(&path).is_err() {
+            continue;
+        }
+        changed += 1;
+        if let Some(image) = image_path_for_sidecar(&path) {
+            rewrites.insert(image, sc);
+        }
+    }
+
+    if changed > 0 && !rewrites.is_empty() {
+        let _ = mutate_index(index_path, |text| {
+            let mut lines: Vec<String> = text.lines().map(str::to_string).collect();
+            if lines.is_empty() {
+                return None;
+            }
+            for line in &mut lines {
+                if line.starts_with('#') {
+                    continue;
+                }
+                let Some(path) = line.split('\t').next() else { continue };
+                let Some(sc) = rewrites.get(path) else { continue };
+                if let Some(rewritten) = index_line_with_sidecar(line, sc) {
+                    *line = rewritten.trim_end_matches('\n').to_string();
+                }
+            }
+            let mut out = lines.join("\n");
+            out.push('\n');
+            Some(out)
+        });
+    }
+    changed
 }
 
 // ---------------------------------------------------------------------------
@@ -756,7 +920,7 @@ pub fn scan_worker(
                                 batch.push(GalleryItem {
                                     id: path_str.clone(), title, path: path_str,
                                            is_folder: true, ext: "".into(), aspect_ratio: 1.0,
-                                           is_animated: false, width: 1.0, height: 1.0,
+                                           width: 1.0, height: 1.0,
                                            border_colors: BorderColors::default(),
                                            margins: Margins::default(),
                                            rating: 0, tags: HashSet::new(), sidecar: Sidecar::default(),
@@ -772,7 +936,7 @@ pub fn scan_worker(
 
                         progress.fetch_add(1, Ordering::Relaxed);
                         let n = processed_total.fetch_add(1, Ordering::Relaxed) + 1;
-                        if n == 1 || n % 500 == 0 {
+                        if n == 1 || n % 10000 == 0 {
                             let elapsed = phase_start.elapsed().as_secs_f64();
                             let rate = n as f64 / elapsed.max(0.001);
                             let eta = if rate > 0.0 { (total_est as f64 - n as f64) / rate } else { 0.0 };
@@ -932,7 +1096,7 @@ pub fn scan_worker(
                         let aspect = if h > 0 { w as f32 / h as f32 } else { 1.0 };
                         batch.push(GalleryItem {
                             id: path_str.clone(), title, path: path_str,
-                                   is_folder: false, ext, aspect_ratio: aspect, is_animated,
+                                   is_folder: false, ext, aspect_ratio: aspect,
                                    width: w as f32, height: h as f32, border_colors, margins,
                                    rating, tags, sidecar,
                         });
@@ -960,7 +1124,7 @@ pub fn scan_worker(
     if let Some(parent) = index_path.parent() {
         let _ = std::fs::create_dir_all(parent);
     }
-    if let Err(e) = write_index_if_changed(&index_path, &all_index_lines) {
+    if let Err(e) = write_scanned_index_rows(&index_path, &dir, &all_index_lines) {
         eprintln!("gallery: [phase 1] ERROR writing index: {}", e);
     }
 
@@ -979,6 +1143,7 @@ pub fn scan_worker(
         eprintln!("gallery: ═══════════════════════════════════════════════════");
         eprintln!("gallery: SCAN COMPLETE in {:.2}s (phases 0+1 only)", scan_start.elapsed().as_secs_f64());
         eprintln!("gallery: ═══════════════════════════════════════════════════");
+        eprintln!("startup: gallery scan complete @ {}ms", crate::startup_ms());
         return;
     }
 
@@ -1031,7 +1196,7 @@ fn spawn_margin_workers(
             ctx.request_repaint();
 
             let n = done.fetch_add(1, Ordering::Relaxed) + 1;
-            if n % 2000 == 0 || n == total {
+            if n % 10000 == 0 || n == total {
                 let elapsed = p2_start.elapsed().as_secs_f64();
                 let rate = n as f64 / elapsed.max(0.001);
                 let eta = if rate > 0.0 { (total as f64 - n as f64) / rate } else { 0.0 };
@@ -1047,42 +1212,42 @@ fn spawn_margin_workers(
         let p2_elapsed = p2_start.elapsed().as_secs_f64();
         eprintln!("gallery: [phase 2] ✅ complete in {:.2}s ({} jobs)", p2_elapsed, total);
 
-        let Ok(text) = std::fs::read_to_string(&index_path) else {
-            eprintln!("gallery: [phase 3] ERROR — could not re-read {}", index_path.display());
-            return;
-        };
-
         let p3_start = Instant::now();
         eprintln!("gallery: [phase 3] merging margin data back into index.tsv...");
 
         let results = results.lock().unwrap();
-        let mut out = String::with_capacity(text.len() + 1024 * 1024);
         let mut merged = 0usize;
-        for line in text.lines() {
-            if line.starts_with('#') { out.push_str(line); out.push('\n'); continue; }
-            let f: Vec<&str> = line.split('\t').collect();
-            if f.len() < 17 {
-                out.push_str(line);
-                out.push('\n');
-                continue;
+        match mutate_index(&index_path, |text| {
+            if text.is_empty() {
+                eprintln!("gallery: [phase 3] ERROR — could not re-read {}", index_path.display());
+                return None;
             }
-            let path = f[0];
-            if let Some((m, c)) = results.get(path) {
-                out.push_str(&format!(
-                    "{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\n",
-                    path, f[1], f[2], f[3], f[4], f[5],
-                    m.top, m.bottom, m.left, m.right,
-                    hex(c.top), hex(c.bottom), hex(c.left), hex(c.right),
-                                      f[14], f[15], f[16]
-                ));
-                merged += 1;
-            } else {
-                out.push_str(line);
-                out.push('\n');
+            let mut out = String::with_capacity(text.len() + 1024 * 1024);
+            for line in text.lines() {
+                if line.starts_with('#') { out.push_str(line); out.push('\n'); continue; }
+                let f: Vec<&str> = line.split('\t').collect();
+                if f.len() < 17 {
+                    out.push_str(line);
+                    out.push('\n');
+                    continue;
+                }
+                let path = f[0];
+                if let Some((m, c)) = results.get(path) {
+                    out.push_str(&format!(
+                        "{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\n",
+                        path, f[1], f[2], f[3], f[4], f[5],
+                        m.top, m.bottom, m.left, m.right,
+                        hex(c.top), hex(c.bottom), hex(c.left), hex(c.right),
+                                          f[14], f[15], f[16]
+                    ));
+                    merged += 1;
+                } else {
+                    out.push_str(line);
+                    out.push('\n');
+                }
             }
-        }
-
-        match write_index_if_changed(&index_path, &out) {
+            Some(out)
+        }) {
             Ok(true) => eprintln!("gallery: [phase 3] ✅ complete in {:.2}s ({} entries updated)",
                                   p3_start.elapsed().as_secs_f64(), merged),
             Ok(false) => eprintln!("gallery: [phase 3] ✅ no changes in {:.2}s ({} entries already current)",
@@ -1092,6 +1257,7 @@ fn spawn_margin_workers(
 
         eprintln!("gallery: ═══════════════════════════════════════════════════");
         eprintln!("gallery: SCAN COMPLETE in {:.2}s total", scan_start.elapsed().as_secs_f64());
+        eprintln!("startup: gallery scan complete @ {}ms", crate::startup_ms());
         eprintln!("gallery:   phase 1 (scan):    {:.2}s", p1_elapsed);
         eprintln!("gallery:   phase 2 (margins): {:.2}s", p2_elapsed);
         eprintln!("gallery:   phase 3 (merge):   {:.2}s", p3_start.elapsed().as_secs_f64());
@@ -1185,6 +1351,69 @@ mod tests {
         dir
     }
 
+    fn index_row(path: &str, mtime: u64) -> String {
+        format!(
+            "{}\t{}\t2\t0\t10\t20\t0\t0\t0\t0\t-\t-\t-\t-\t0\t-\t{{}}\n",
+            path, mtime
+        )
+    }
+
+    #[test]
+    fn scanning_an_empty_folder_keeps_other_library_cache_rows() {
+        let keep = "/library/keep.webp";
+        let sibling = "/library2/sibling.webp";
+        let stale = "/empty/gone.webp";
+        let old = format!(
+            "#{}\n{}{}{}",
+            INDEX_VERSION,
+            index_row(keep, 1),
+            index_row(sibling, 2),
+            index_row(stale, 3),
+        );
+        let scanned = format!("#{}\n", INDEX_VERSION);
+
+        let merged = merge_index_rows(&old, Path::new("/empty"), &scanned);
+        let idx = parse_index_text(&merged);
+
+        assert_eq!(idx.len(), 2);
+        assert!(idx.contains_key(keep));
+        assert!(idx.contains_key(sibling));
+        assert!(!idx.contains_key(stale));
+    }
+
+    #[test]
+    fn scanning_a_folder_refreshes_only_its_own_rows() {
+        let old = format!(
+            "#{}\n{}{}{}",
+            INDEX_VERSION,
+            index_row("/dir/a.webp", 1),
+            index_row("/dir/b.webp", 2),
+            index_row("/other/c.webp", 3),
+        );
+        let scanned = format!(
+            "#{}\n{}",
+            INDEX_VERSION,
+            index_row("/dir/a.webp", 9),
+        );
+
+        let merged = merge_index_rows(&old, Path::new("/dir"), &scanned);
+        let idx = parse_index_text(&merged);
+
+        assert_eq!(idx.len(), 2);
+        assert_eq!(idx["/dir/a.webp"].mtime, 9);
+        assert!(!idx.contains_key("/dir/b.webp"));
+        assert!(idx.contains_key("/other/c.webp"));
+
+        // The refreshed row exists exactly once.
+        assert_eq!(
+            merged
+                .lines()
+                .filter(|line| line.starts_with("/dir/a.webp\t"))
+                .count(),
+            1
+        );
+    }
+
     #[test]
     fn identical_index_rewrite_is_skipped() {
         let dir = scratch("rewrite");
@@ -1223,6 +1452,43 @@ mod tests {
         assert_eq!(e.extra.alt_text, "updated");
 
         std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn global_tag_rewrite_updates_sidecars_and_index() {
+        let root = scratch("rewrite-tags");
+        let image = root.join("a.webp");
+        std::fs::write(&image, b"x").unwrap();
+        let sidecar_path = root.join(".a.halo.json");
+        let mut sc = Sidecar::default();
+        sc.tags = vec!["old".into()];
+        sc.tag_parents.insert("old".into(), "parent".into());
+        sc.save_to(&sidecar_path).unwrap();
+
+        let index = root.join("index.tsv");
+        std::fs::write(
+            &index,
+            format!(
+                "#{}\n{}\t1\t2\t0\t10\t20\t0\t0\t0\t0\t-\t-\t-\t-\t0\told\t{{}}\n",
+                INDEX_VERSION,
+                image.to_string_lossy()
+            ),
+        )
+        .unwrap();
+
+        let changed = rewrite_tag_metadata(&root, &index, |sc| {
+            if !sc.tags.iter().any(|tag| tag == "old") {
+                return false;
+            }
+            sc.tags = vec!["new".into()];
+            sc.tag_parents.clear();
+            true
+        });
+        assert_eq!(changed, 1);
+        assert_eq!(Sidecar::load(&image).unwrap().tags, vec!["new"]);
+        assert_eq!(load_index(&index)[image.to_string_lossy().as_ref()].tags, vec!["new"]);
+
+        std::fs::remove_dir_all(root).unwrap();
     }
 
     #[test]

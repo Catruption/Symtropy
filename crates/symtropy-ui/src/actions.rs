@@ -9,6 +9,7 @@
 use crate::file_manager::{SortDirection, SortKey};
 use egui::{Color32, DragAndDrop, PointerButton, Rect, Response, Stroke, Ui};
 use std::path::{Path, PathBuf};
+use x11rb::protocol::xproto::KeyButMask;
 
 /// A command emitted by a view and applied by the app.
 #[derive(Clone, Debug)]
@@ -44,6 +45,13 @@ pub enum Action {
     SetRating { paths: Vec<PathBuf>, rating: u8 },
     EditTag { paths: Vec<PathBuf>, remove: bool },
     ApplyTag { paths: Vec<PathBuf>, tag: String, remove: bool },
+    ApplyTagToSelected { tag: String, remove: bool },
+    ApplyTagFilter(String),
+
+    // Tag-tree management (DigiKam-style)
+    TagDialog(TagDialog),
+    TagCommit { kind: TagDialog, text: String },
+
     FindDuplicates,
     ToggleSlideshow,
 
@@ -59,10 +67,30 @@ pub enum Action {
     SelectInverse,
     SelectPaths(Vec<PathBuf>),
     ClearSelection,
+    /// Reset the active gallery query and the sidebar's structured filter fields.
+    ClearFilters,
     SetSort { key: SortKey, descending: bool },
     ToggleSortDirection,
     ToggleHidden,
     Refresh,
+}
+
+/// A taxonomy edit requested from the sidebar tag tree. The dialog collects the
+/// new name or target, then emits the corresponding commit action.
+#[derive(Clone, Debug)]
+pub enum TagDialog {
+    New { parent: Option<String> },
+    Rename { tag: String },
+    Move { tag: String },
+    Merge { source: String },
+    Delete { tag: String },
+}
+
+/// The sidebar tag node a context menu was opened on.
+#[derive(Clone, Debug)]
+pub struct TagMenuTarget {
+    pub name: String,
+    pub token: String,
 }
 
 /// What a right-click (or right-drag) was aimed at.
@@ -99,6 +127,9 @@ pub enum Click {
     Secondary,
     /// Secondary drag: pick up the selection and start a file operation.
     Drag,
+    /// Primary drag on an entry: keep egui's normal left-drag scrolling, but arm
+    /// the OS drag source so the files can still be dropped outside the app.
+    PrimaryDrag,
 }
 
 /// Classify a widget's pointer activity. Checked in priority order so a
@@ -111,20 +142,23 @@ pub fn classify(ui: &Ui, response: &Response) -> Option<Click> {
     // events other widgets still need to see this frame.
     let clicked = response.clicked();
     let double_clicked = response.double_clicked();
-    let (double, secondary_click, secondary_drag, primary_click) = ui.input(|i| {
+    let (double, secondary_click, secondary_drag, primary_drag, primary_click) = ui.input(|i| {
         let p = &i.pointer;
         let pos = p.latest_pos().or_else(|| p.press_origin());
         let in_widget = pos.map_or(false, |pos| response.rect.contains(pos));
         let drag_origin = p
             .press_origin()
             .map_or(in_widget, |origin| response.rect.contains(origin));
+        let dragging = p.is_decidedly_dragging() && drag_origin;
         (
             double_clicked && p.button_double_clicked(PointerButton::Primary) && in_widget,
             p.button_clicked(PointerButton::Secondary) && in_widget,
             p.button_down(PointerButton::Secondary)
                 && !p.button_down(PointerButton::Primary)
-                && p.is_decidedly_dragging()
-                && drag_origin,
+                && dragging,
+            p.button_down(PointerButton::Primary)
+                && !p.button_down(PointerButton::Secondary)
+                && dragging,
             clicked && !p.button_down(PointerButton::Secondary),
         )
     });
@@ -137,6 +171,8 @@ pub fn classify(ui: &Ui, response: &Response) -> Option<Click> {
         Some(Click::Secondary)
     } else if secondary_drag {
         Some(Click::Drag)
+    } else if primary_drag {
+        Some(Click::PrimaryDrag)
     } else if primary_click {
         Some(Click::Primary)
     } else {
@@ -164,8 +200,23 @@ pub fn begin_drag(ui: &Ui, paths: Vec<PathBuf>) {
         return;
     }
     let copy = ui.input(|i| i.modifiers.ctrl);
+    // Keep egui's in-process payload for drops inside Symtropy. The XDND bridge
+    // stays idle until the pointer actually leaves our windows, so internal
+    // move/copy/trash behavior is unchanged.
+    crate::drag_source::begin_drag(&paths, copy, KeyButMask::BUTTON3);
     DragAndDrop::set_payload(ui.ctx(), DragPayload { paths, copy });
     ui.ctx().request_repaint();
+}
+
+/// Arm the OS drag source for a left-drag on an entry, without creating an
+/// egui payload. Left-drag must keep scrolling/selecting normally inside the
+/// app; the XDND bridge only takes over if the pointer leaves our windows.
+pub fn begin_external_drag(ui: &Ui, paths: Vec<PathBuf>) {
+    if paths.is_empty() {
+        return;
+    }
+    let copy = ui.input(|i| i.modifiers.ctrl);
+    crate::drag_source::begin_drag(&paths, copy, KeyButMask::BUTTON1);
 }
 
 /// Take the drag payload if the pointer was released over `response`.
@@ -441,6 +492,54 @@ pub fn show_menu(
                 MenuEntry::Item(MenuItem { label, action }) => {
                     let enabled = !matches!(action, Action::Paste(_)) || options.can_paste;
                     if ui.add_enabled(enabled, egui::Button::new(label)).clicked() {
+                        actions.push(action);
+                        ui.close_menu();
+                    }
+                }
+            }
+        }
+    });
+}
+
+/// DigiKam-style commands for a tag-tree node. Kept here with the file menus so
+/// every right-click emits the same `Action` vocabulary.
+pub fn tag_menu_entries(target: &TagMenuTarget) -> Vec<MenuEntry> {
+    vec![
+        item("Filter by This Tag", Action::ApplyTagFilter(target.token.clone())),
+        item(
+            "Assign Tag to Selected Images",
+            Action::ApplyTagToSelected { tag: target.name.clone(), remove: false },
+        ),
+        item(
+            "Remove Tag from Selected Images",
+            Action::ApplyTagToSelected { tag: target.name.clone(), remove: true },
+        ),
+        MenuEntry::Separator,
+        item("New Child Tag…", Action::TagDialog(TagDialog::New { parent: Some(target.name.clone()) })),
+        item("New Top-Level Tag…", Action::TagDialog(TagDialog::New { parent: None })),
+        MenuEntry::Separator,
+        item("Rename…", Action::TagDialog(TagDialog::Rename { tag: target.name.clone() })),
+        item("Move…", Action::TagDialog(TagDialog::Move { tag: target.name.clone() })),
+        item("Merge…", Action::TagDialog(TagDialog::Merge { source: target.name.clone() })),
+        item("Delete…", Action::TagDialog(TagDialog::Delete { tag: target.name.clone() })),
+    ]
+}
+
+/// Attach the tag menu to a single node row. Actions are collected so the
+/// viewer closure never mutates gallery state directly.
+pub fn show_tag_menu(
+    response: &Response,
+    target: TagMenuTarget,
+    actions: &mut Vec<Action>,
+) {
+    response.context_menu(|ui| {
+        for entry in tag_menu_entries(&target) {
+            match entry {
+                MenuEntry::Separator => {
+                    ui.separator();
+                }
+                MenuEntry::Item(MenuItem { label, action }) => {
+                    if ui.button(label).clicked() {
                         actions.push(action);
                         ui.close_menu();
                     }

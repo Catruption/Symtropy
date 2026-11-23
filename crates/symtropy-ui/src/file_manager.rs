@@ -383,18 +383,6 @@ impl FileManagerState {
         self.sort_entries();
     }
 
-    pub fn open_terminal(&self) {
-        for t in ["konsole", "gnome-terminal", "alacritty", "kitty", "xterm"] {
-            if std::process::Command::new(t)
-                .current_dir(&self.current_dir)
-                .spawn()
-                .is_ok()
-            {
-                return;
-            }
-        }
-    }
-
     pub fn open_smart(&self, path: &Path) {
         if path.is_dir() {
             let _ = open::that(path);
@@ -415,19 +403,6 @@ impl FileManagerState {
         let _ = open::that(path);
     }
 
-    pub fn trash_selected(&mut self) {
-        for p in &self.selected {
-            let _ = trash::delete(p);
-        }
-        self.refresh();
-    }
-
-    pub fn add_bookmark(&mut self) {
-        if !self.bookmarks.paths.contains(&self.current_dir) {
-            self.bookmarks.paths.push(self.current_dir.clone());
-            self.bookmarks.save();
-        }
-    }
 }
 
 fn metadata_key(path: &Path) -> (u64, i64) {

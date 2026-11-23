@@ -25,6 +25,7 @@
 //! but queries cannot. Normalize names with underscores (`warrior_cats`)
 //! before using them in queries.
 
+use super::hierarchy::tag_key;
 use super::Hierarchy;
 use std::collections::HashSet;
 use std::fmt;
@@ -41,8 +42,12 @@ pub enum Query {
 }
 
 impl Query {
-    /// Parse `input`. Empty input is `AlwaysTrue`.
+    /// Parse `input`. Empty input and the persisted wildcard form are `AlwaysTrue`.
     pub fn parse(input: &str) -> Result<Self, String> {
+        let trimmed = input.trim();
+        if trimmed.is_empty() || trimmed == "*" {
+            return Ok(Query::AlwaysTrue);
+        }
         let tokens = tokenize(input)?;
         if tokens.is_empty() {
             return Ok(Query::AlwaysTrue);
@@ -64,10 +69,12 @@ impl Query {
         match self {
             Query::Tag(t) => {
                 // Directly tagged or tagged with any descendant of `t`.
-                applied.contains(t)
-                    || applied
-                        .iter()
-                        .any(|a| hierarchy.is_descendant_of(a, t))
+                // Whitespace is normalized on both sides because taxonomy names
+                // can contain spaces while query tokens cannot.
+                let wanted = tag_key(t);
+                applied
+                    .iter()
+                    .any(|a| tag_key(a) == wanted || hierarchy.is_descendant_of(a, t))
             }
             Query::Rating { min, exact } => {
                 if *exact {
@@ -86,6 +93,36 @@ impl Query {
             }
             Query::AlwaysTrue => true,
         }
+    }
+
+    /// Rewrite tag leaves, dropping any tag the mapper rejects. Used when the
+    /// taxonomy changes so an active filter does not silently keep a stale name.
+    pub fn map_tags(&self, map: &impl Fn(&str) -> Option<String>) -> Self {
+        fn walk(q: &Query, map: &impl Fn(&str) -> Option<String>) -> Option<Query> {
+            match q {
+                Query::Tag(tag) => map(tag).map(Query::Tag),
+                Query::Rating { .. } | Query::AlwaysTrue => Some(q.clone()),
+                Query::Not(inner) => walk(inner, map).map(|inner| Query::Not(Box::new(inner))),
+                Query::And(qs) => {
+                    let parts: Vec<Query> = qs.iter().filter_map(|q| walk(q, map)).collect();
+                    (!parts.is_empty()).then(|| Query::And(parts))
+                }
+                Query::Or(qs) => {
+                    let parts: Vec<Query> = qs.iter().filter_map(|q| walk(q, map)).collect();
+                    (!parts.is_empty()).then(|| Query::Or(parts))
+                }
+                Query::Except(qs) => {
+                    let parts: Vec<Query> = qs.iter().filter_map(|q| walk(q, map)).collect();
+                    match parts.len() {
+                        0 => None,
+                        1 => Some(parts.into_iter().next().unwrap()),
+                        _ => Some(Query::Except(parts)),
+                    }
+                }
+            }
+        }
+
+        walk(self, map).unwrap_or(Query::AlwaysTrue)
     }
 }
 
@@ -343,6 +380,25 @@ mod tests {
     #[test]
     fn parse_tag() {
         assert_eq!(Query::parse("fox").unwrap(), Query::Tag("fox".into()));
+    }
+
+    #[test]
+    fn underscored_query_matches_spaced_tag() {
+        let mut tags = HashSet::new();
+        tags.insert("derpy hooves".to_string());
+        let hierarchy = Hierarchy::parse("MLP\n  derpy hooves\n");
+
+        assert!(Query::parse("derpy_hooves").unwrap().matches(&tags, 0, &hierarchy));
+        assert!(Query::parse("MLP").unwrap().matches(&tags, 0, &hierarchy));
+    }
+
+    #[test]
+    fn wildcard_round_trip_is_always_true() {
+        let saved = Query::AlwaysTrue.to_string();
+        assert_eq!(saved, "*");
+        assert_eq!(Query::parse(&saved).unwrap(), Query::AlwaysTrue);
+        assert_eq!(Query::parse("  *  ").unwrap(), Query::AlwaysTrue);
+        assert!(Query::AlwaysTrue.matches(&tag(""), 0, &h()));
     }
 
     #[test]

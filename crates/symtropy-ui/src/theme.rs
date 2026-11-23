@@ -75,6 +75,8 @@ impl Default for TitleBarConfig {
     }
 }
 
+/// Decoration metadata for the window buttons. `position`/`offset_x`/`offset_y` are retained for
+/// theme compatibility but do not define interactive hit targets; see `window::layout`.
 #[derive(Deserialize, Clone, Debug)]
 #[serde(default, rename_all = "camelCase")]
 pub struct ControlsConfig {

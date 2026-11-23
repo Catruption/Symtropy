@@ -98,20 +98,6 @@ impl Sidecar {
         out
     }
 
-    /// Migrate legacy `<stem>.halo.json` → `.<stem>.halo.json`.
-    /// This is a single rename syscall — no read, no write, no parse.
-    pub fn migrate_if_needed(image_path: &Path) {
-        let stem_json = Self::path_for(image_path);
-        let legacy = Self::legacy_json_path(image_path);
-
-        if legacy != stem_json && legacy.exists() && !stem_json.exists() {
-            if std::fs::rename(&legacy, &stem_json).is_ok() {
-                // Uncomment if you want per-file migration logs:
-                // eprintln!("sidecar: migrated {} -> {}", legacy.display(), stem_json.display());
-            }
-        }
-    }
-
     pub fn load_with_source(image_path: &Path) -> Option<(Self, LoadSource)> {
         let stem_json = Self::path_for(image_path);
 
@@ -181,19 +167,7 @@ impl Sidecar {
 
     pub fn save(&self, image_path: &Path) -> std::io::Result<()> {
         let json_path = Self::path_for(image_path);
-        let text = serde_json::to_string_pretty(self)
-        .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?;
-
-        // Do not replace the sidecar when nothing changed. The temp-file rename
-        // is otherwise invisible to the image cache but still churns mtimes.
-        let unchanged = std::fs::read_to_string(&json_path)
-            .map(|old| old == text)
-            .unwrap_or(false);
-        if !unchanged {
-            let tmp = json_path.with_extension("json.tmp");
-            std::fs::write(&tmp, text)?;
-            std::fs::rename(&tmp, &json_path)?;
-        }
+        self.save_to(&json_path)?;
 
         // Clean up legacy file if it somehow still exists
         let legacy = Self::legacy_json_path(image_path);
@@ -201,6 +175,21 @@ impl Sidecar {
             let _ = std::fs::remove_file(legacy);
         }
 
+        Ok(())
+    }
+
+    /// Write to an explicit sidecar path, skipping byte-identical rewrites.
+    pub fn save_to(&self, json_path: &Path) -> std::io::Result<()> {
+        let text = serde_json::to_string_pretty(self)
+            .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?;
+        let unchanged = std::fs::read_to_string(json_path)
+            .map(|old| old == text)
+            .unwrap_or(false);
+        if !unchanged {
+            let tmp = json_path.with_extension("json.tmp");
+            std::fs::write(&tmp, text)?;
+            std::fs::rename(&tmp, json_path)?;
+        }
         Ok(())
     }
 }

@@ -19,8 +19,8 @@
     },
     "controls": {
         "position": "top-right",
-        "offsetX": -500,
-        "offsetY": 470,
+        "offsetX": 0,
+        "offsetY": 0,
         "size": 80,
         "overlap": 25,
         "enabled": true

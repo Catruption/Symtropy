@@ -3,12 +3,22 @@
 //! The full path stays visible, while hovering any segment opens a compact list
 //! of that directory's sibling folders. Clicking a segment navigates to that
 //! ancestor; clicking a row jumps sideways in one action.
+//!
+//! Layout: the action buttons (pin / edit / copy / menu) have a fixed slot on
+//! the right and never wrap. The path itself lives in a horizontal scroll
+//! area that sticks to the right, so a long path scrolls instead of pushing the
+//! buttons onto a second row underneath other widgets.
 
 use crate::actions::{self, Action, ContextTarget, MenuOptions};
-use egui::{Button, Color32, Key, Pos2, Rect, RichText, Ui, Vec2, Window, pos2};
+use egui::{
+    Align, Button, Color32, Key, Layout, Pos2, Rect, RichText, ScrollArea, Ui, Window, pos2, vec2,
+};
 use std::collections::HashMap;
 use std::fs;
 use std::path::{Component, Path, PathBuf};
+
+/// Width reserved for the pin / edit / copy / menu buttons.
+const ACTIONS_WIDTH: f32 = 140.0;
 
 #[derive(Clone, Debug)]
 struct Row {
@@ -18,15 +28,28 @@ struct Row {
     current: bool,
 }
 
+/// Sibling folder list for one parent directory. Read once per dropdown
+/// opening, not once per frame.
+struct SiblingCache {
+    parent: PathBuf,
+    show_hidden: bool,
+    dirs: Vec<PathBuf>,
+}
+
 pub struct PathBarState {
     open: bool,
     pinned: bool,
     hovered: Option<usize>,
+    /// Set after a click navigated away. The pointer is still sitting on the
+    /// bar in the new layout; without this latch the dropdown reopens at once
+    /// and covers whatever the user is about to click next.
+    suppress_hover: bool,
     editing: bool,
     edit_text: String,
     request_focus: bool,
     filter: String,
     counts: Option<HashMap<PathBuf, usize>>,
+    sibling_cache: Option<SiblingCache>,
     last_dir: Option<PathBuf>,
     path_bar_rect: Rect,
     dropdown_rect: Rect,
@@ -39,14 +62,16 @@ impl Default for PathBarState {
             open: false,
             pinned: false,
             hovered: None,
+            suppress_hover: false,
             editing: false,
             edit_text: String::new(),
             request_focus: false,
             filter: String::new(),
             counts: None,
+            sibling_cache: None,
             last_dir: None,
-            path_bar_rect: empty_rect(),
-            dropdown_rect: empty_rect(),
+            path_bar_rect: Rect::NOTHING,
+            dropdown_rect: Rect::NOTHING,
             segment_rects: Vec::new(),
         }
     }
@@ -63,6 +88,7 @@ impl PathBarState {
 
     pub fn invalidate_counts(&mut self) {
         self.counts = None;
+        self.sibling_cache = None;
     }
 
     fn close(&mut self) {
@@ -70,15 +96,71 @@ impl PathBarState {
         self.pinned = false;
         self.hovered = None;
         self.filter.clear();
+        self.sibling_cache = None;
+    }
+
+    /// Close after a navigation click and keep the dropdown shut until the
+    /// pointer has left the segments once.
+    fn close_after_navigate(&mut self) {
+        self.close();
+        self.suppress_hover = true;
     }
 }
 
-fn empty_rect() -> Rect {
-    Rect::from_min_size(Pos2::ZERO, Vec2::ZERO)
-}
-
+/// Grow `target` to include `other`. `Rect::NOTHING` is the identity, so an
+/// untouched accumulator does not drag the union out to the screen origin.
 fn grow(target: &mut Rect, other: Rect) {
     *target = target.union(other);
+}
+
+/// Make a path absolute without touching symlinks. A relative path (for
+/// example from launching with a relative argument) would otherwise produce
+/// relative "ancestors" that only resolve from one working directory.
+fn absolutize(path: &Path) -> PathBuf {
+    if path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        std::env::current_dir()
+            .map(|cwd| cwd.join(path))
+            .unwrap_or_else(|_| path.to_path_buf())
+    }
+}
+
+/// Lexically drop `.` and resolve `..` components.
+fn normalize(path: &Path) -> PathBuf {
+    let mut out = PathBuf::new();
+    for component in path.components() {
+        match component {
+            Component::CurDir => {}
+            Component::ParentDir => {
+                let can_pop = matches!(out.components().next_back(), Some(Component::Normal(_)));
+                if can_pop {
+                    out.pop();
+                } else if !out.has_root() {
+                    out.push("..");
+                }
+            }
+            other => out.push(other.as_os_str()),
+        }
+    }
+    if out.as_os_str().is_empty() {
+        out.push("/");
+    }
+    out
+}
+
+/// Turn text typed into the edit box into an absolute path: `~` expands to
+/// home, relative text is resolved against the directory being shown.
+fn resolve_typed(text: &str, base: &Path) -> PathBuf {
+    let text = text.trim();
+    let home = dirs::home_dir();
+    let expanded = match (text, &home) {
+        ("~", Some(h)) => h.clone(),
+        (t, Some(h)) if t.starts_with("~/") => h.join(&t[2..]),
+        _ => PathBuf::from(text),
+    };
+    let absolute = if expanded.is_absolute() { expanded } else { base.join(expanded) };
+    normalize(&absolute)
 }
 
 /// Every clickable component of the path, including `/` as index 0.
@@ -122,7 +204,13 @@ fn sibling_dirs(parent: &Path, show_hidden: bool) -> Vec<PathBuf> {
         if !show_hidden && name.starts_with('.') {
             continue;
         }
-        if entry.path().is_dir() {
+        // file_type() is free on most filesystems; only symlinks need a stat.
+        let is_dir = match entry.file_type() {
+            Ok(t) if t.is_dir() => true,
+            Ok(t) if t.is_symlink() => entry.path().is_dir(),
+            _ => false,
+        };
+        if is_dir {
             dirs.push(entry.path());
         }
     }
@@ -144,6 +232,9 @@ pub fn show(
     options: MenuOptions,
     actions: &mut Vec<Action>,
 ) {
+    let dir_owned = normalize(&absolutize(dir));
+    let dir = dir_owned.as_path();
+
     if state.last_dir.as_deref() != Some(dir) {
         state.last_dir = Some(dir.to_path_buf());
         state.close();
@@ -155,23 +246,25 @@ pub fn show(
     if state.open && !state.pinned {
         let pointer = ui.ctx().input(|i| i.pointer.latest_pos());
         let zone = state.path_bar_rect.union(state.dropdown_rect).expand(6.0);
-        if pointer.map_or(false, |p| !zone.contains(p)) {
-            state.open = false;
-            state.hovered = None;
+        if pointer.map_or(true, |p| !zone.contains(p)) {
+            state.close();
         }
     }
 
     let segs = segments(dir);
     let current_index = segs.len().saturating_sub(1);
     let mut segment_rects = Vec::with_capacity(segs.len());
-    let mut bar_rect = empty_rect();
+    let mut bar_rect = Rect::NOTHING;
     let mut hovered_now = None;
+    let mut over_segment = false;
 
     let mut menu_action = None;
     let menu_target = segs
         .get(state.hovered.unwrap_or(current_index))
         .map(|(_, path)| path.clone())
         .unwrap_or_else(|| dir.to_path_buf());
+
+    let bar_bounds = ui.available_rect_before_wrap();
 
     ui.scope(|ui| {
         ui.spacing_mut().item_spacing.x = 2.0;
@@ -187,52 +280,90 @@ pub fn show(
                 response.request_focus();
                 state.request_focus = false;
             }
-            if response.has_focus() {
-                if ui.input(|i| i.key_pressed(Key::Enter)) {
-                    let target = PathBuf::from(&state.edit_text);
+
+            // A single-line TextEdit gives up focus the moment Enter or Escape
+            // is pressed, so `has_focus()` is already false on that frame.
+            // `lost_focus()` is the signal that is actually set.
+            if response.lost_focus() {
+                let (enter, escape) =
+                    ui.input(|i| (i.key_pressed(Key::Enter), i.key_pressed(Key::Escape)));
+                if enter {
+                    let target = resolve_typed(&state.edit_text, dir);
                     if target.is_dir() {
                         actions.push(Action::Navigate(target));
                         state.editing = false;
+                    } else {
+                        // Not a directory: stay in the box so it can be fixed.
+                        response.request_focus();
                     }
-                } else if ui.input(|i| i.key_pressed(Key::Escape)) {
+                } else if escape {
+                    state.editing = false;
+                } else {
+                    // Clicked somewhere else.
                     state.editing = false;
                 }
             }
         } else {
-            ui.horizontal_wrapped(|ui| {
-                for (index, (label, path)) in segs.iter().enumerate() {
-                    if index > 0 {
-                        let sep = ui.label(RichText::new("/").color(Color32::from_gray(120)));
-                        grow(&mut bar_rect, sep.rect);
-                    }
+            let row_h = ui.spacing().interact_size.y;
+            ui.horizontal(|ui| {
+                let path_w = (ui.available_width() - ACTIONS_WIDTH - 8.0).max(60.0);
 
-                    let color = if index == current_index {
-                        Color32::WHITE
-                    } else {
-                        Color32::from_gray(180)
-                    };
-                    let text = if state.hovered == Some(index) {
-                        format!("{} ▾", label)
-                    } else if index == 0 {
-                        "💽".to_string()
-                    } else {
-                        label.clone()
-                    };
-                    let response = ui.add(Button::new(RichText::new(text).color(color)).frame(false));
-                    if response.hovered() {
-                        hovered_now = Some(index);
-                        state.open = true;
-                        state.hovered = Some(index);
-                    }
-                    if response.clicked() {
-                        actions.push(Action::Navigate(path.clone()));
-                        state.close();
-                    }
-                    grow(&mut bar_rect, response.rect);
-                    while segment_rects.len() <= index {
-                        segment_rects.push(response.rect);
-                    }
-                }
+                ui.allocate_ui_with_layout(
+                    vec2(path_w, row_h),
+                    Layout::left_to_right(Align::Center),
+                    |ui| {
+                        ScrollArea::horizontal()
+                            .auto_shrink([false, true])
+                            .stick_to_right(true)
+                            .show(ui, |ui| {
+                                ui.horizontal(|ui| {
+                                    for (index, (label, path)) in segs.iter().enumerate() {
+                                        if index > 0 {
+                                            let sep = ui.label(
+                                                RichText::new("/").color(Color32::from_gray(120)),
+                                            );
+                                            grow(&mut bar_rect, sep.rect);
+                                        }
+
+                                        let active = state.open && state.hovered == Some(index);
+                                        let color = if active {
+                                            Color32::from_rgb(255, 220, 140)
+                                        } else if index == current_index {
+                                            Color32::WHITE
+                                        } else {
+                                            Color32::from_gray(180)
+                                        };
+                                        // The label never changes with hover. Swapping
+                                        // in a wider "name ▾" label shifted every segment
+                                        // to its right mid-click.
+                                        let text = if index == 0 { "💽".to_string() } else { label.clone() };
+                                        let response =
+                                            ui.add(Button::new(RichText::new(text).color(color)).frame(false));
+
+                                        if response.hovered() {
+                                            over_segment = true;
+                                            if !state.suppress_hover {
+                                                // A filter typed for one segment's siblings
+                                                // must not follow the pointer to another.
+                                                if state.hovered != Some(index) {
+                                                    state.filter.clear();
+                                                }
+                                                hovered_now = Some(index);
+                                                state.open = true;
+                                                state.hovered = Some(index);
+                                            }
+                                        }
+                                        if response.clicked() {
+                                            actions.push(Action::Navigate(path.clone()));
+                                            state.close_after_navigate();
+                                        }
+                                        grow(&mut bar_rect, response.rect);
+                                        segment_rects.push(response.rect);
+                                    }
+                                });
+                            });
+                    },
+                );
 
                 ui.add_space(8.0);
                 if ui.small_button("📌").on_hover_text("Keep this folder list open").clicked() {
@@ -272,48 +403,74 @@ pub fn show(
         }
     });
 
+    if !over_segment {
+        state.suppress_hover = false;
+    }
+
     if let Some(action) = menu_action {
         actions.push(action);
         state.close();
     }
 
+    // Segments scrolled out of view must not widen the hover zone.
+    let bar_rect = if bar_rect.intersects(bar_bounds) {
+        bar_rect.intersect(bar_bounds)
+    } else {
+        bar_rect
+    };
+
     state.segment_rects = segment_rects;
     state.path_bar_rect = bar_rect;
 
     let Some(index) = hovered_now.or(state.hovered) else {
-        state.dropdown_rect = empty_rect();
+        state.dropdown_rect = Rect::NOTHING;
         return;
     };
     if !state.open || state.editing {
-        state.dropdown_rect = empty_rect();
+        state.dropdown_rect = Rect::NOTHING;
         return;
     }
     let Some(segment) = segs.get(index) else {
-        state.dropdown_rect = empty_rect();
+        state.dropdown_rect = Rect::NOTHING;
         return;
     };
 
-    let parent = segment.1.parent().unwrap_or(Path::new("/"));
-    let index_path = crate::paths::cache_dir().join("index.tsv");
-    let counts = state.counts.get_or_insert_with(|| {
-        crate::gallery::workers::directory_counts(&index_path)
-    });
+    let parent = segment.1.parent().unwrap_or(Path::new("/")).to_path_buf();
 
-    let rows: Vec<Row> = sibling_dirs(parent, show_hidden)
-        .into_iter()
-        .map(|path| {
-            let name = path
-                .file_name()
-                .map(|n| n.to_string_lossy().into_owned())
-                .unwrap_or_default();
-            let count = counts.get(&path).copied().unwrap_or(0);
-            let current = path == segment.1;
-            Row { path, name, count, current }
-        })
-        .collect();
+    // Read the sibling list once per opening instead of every frame.
+    let stale = state
+        .sibling_cache
+        .as_ref()
+        .map_or(true, |c| c.parent != parent || c.show_hidden != show_hidden);
+    if stale {
+        state.sibling_cache = Some(SiblingCache {
+            parent: parent.clone(),
+            show_hidden,
+            dirs: sibling_dirs(&parent, show_hidden),
+        });
+    }
+
+    let index_path = crate::paths::cache_dir().join("index.tsv");
+    let rows: Vec<Row> = {
+        let counts = state.counts.get_or_insert_with(|| {
+            crate::gallery::workers::directory_counts(&index_path)
+        });
+        let dirs = state.sibling_cache.as_ref().map(|c| c.dirs.as_slice()).unwrap_or(&[]);
+        dirs.iter()
+            .map(|path| {
+                let name = path
+                    .file_name()
+                    .map(|n| n.to_string_lossy().into_owned())
+                    .unwrap_or_default();
+                let count = counts.get(path).copied().unwrap_or(0);
+                let current = *path == segment.1;
+                Row { path: path.clone(), name, count, current }
+            })
+            .collect()
+    };
 
     let anchor = state.segment_rects.get(index).copied().unwrap_or(bar_rect);
-    let anchor_pos = pos2(anchor.min.x, anchor.max.y + 2.0);
+    let anchor_pos: Pos2 = pos2(anchor.min.x.max(bar_bounds.left()), anchor.max.y + 2.0);
     let mut filter = std::mem::take(&mut state.filter);
     let mut picked = None;
 
@@ -336,7 +493,7 @@ pub fn show(
             ui.separator();
 
             let needle = filter.trim().to_lowercase();
-            egui::ScrollArea::vertical()
+            ScrollArea::vertical()
                 .max_height(320.0)
                 .auto_shrink([false, false])
                 .show(ui, |ui| {
@@ -363,15 +520,14 @@ pub fn show(
         });
 
     state.filter = filter;
-    if let Some(response) = shown {
-        state.dropdown_rect = response.response.rect;
-    } else {
-        state.dropdown_rect = empty_rect();
-    }
+    state.dropdown_rect = match shown {
+        Some(response) => response.response.rect,
+        None => Rect::NOTHING,
+    };
 
     if let Some(path) = picked {
         actions.push(Action::Navigate(path));
-        state.close();
+        state.close_after_navigate();
     }
 }
 
@@ -408,5 +564,23 @@ mod tests {
         let labels: Vec<&str> = segs.iter().map(|(s, _)| s.as_str()).collect();
         assert_eq!(labels, ["/", "home", "cashmere", "Pictures", "Plush"]);
         assert_eq!(segs.last().unwrap().1, dir);
+    }
+
+    #[test]
+    fn normalize_resolves_dots() {
+        assert_eq!(normalize(Path::new("/a/./b/../c")), PathBuf::from("/a/c"));
+        assert_eq!(normalize(Path::new("/..")), PathBuf::from("/"));
+    }
+
+    #[test]
+    fn typed_relative_paths_resolve_against_current_dir() {
+        assert_eq!(resolve_typed("sub/x", Path::new("/a/b")), PathBuf::from("/a/b/sub/x"));
+        assert_eq!(resolve_typed("../c", Path::new("/a/b")), PathBuf::from("/a/c"));
+        assert_eq!(resolve_typed("/abs", Path::new("/a/b")), PathBuf::from("/abs"));
+    }
+
+    #[test]
+    fn absolutize_makes_relative_paths_absolute() {
+        assert!(absolutize(Path::new("some/relative")).is_absolute());
     }
 }

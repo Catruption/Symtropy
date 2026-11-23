@@ -13,12 +13,6 @@ pub struct Vertex {
     pub alpha: f32,
 }
 
-#[derive(Clone, Copy, Debug)]
-pub enum Filter {
-    Invert = 0,
-    Grayscale = 1,
-}
-
 #[derive(Default, Debug)]
 pub struct FilterBatch {
     verts: Vec<Vertex>,
@@ -26,10 +20,6 @@ pub struct FilterBatch {
 }
 
 impl FilterBatch {
-    pub fn is_empty(&self) -> bool {
-        self.verts.is_empty()
-    }
-
     pub fn len(&self) -> usize {
         self.verts.len()
     }
@@ -112,16 +102,11 @@ in float v_alpha;
 uniform sampler2D u_font;
 uniform sampler2D u_back;
 uniform vec2 u_screen_px;
-uniform int u_filter;
 out vec4 o_color;
 
 vec3 apply(vec3 c) {
-if (u_filter == 1) {
-    float g = dot(c, vec3(0.299, 0.587, 0.114));
-    return vec3(g);
-    }
     return vec3(1.0) - c;
-    }
+}
 
     void main() {
     float m;
@@ -146,7 +131,6 @@ if (u_filter == 1) {
                 loc_screen_px: Option<glow::UniformLocation>,
                 loc_font: Option<glow::UniformLocation>,
                 loc_back: Option<glow::UniformLocation>,
-                loc_filter: Option<glow::UniformLocation>,
             }
 
             impl GlState {
@@ -200,7 +184,6 @@ if (u_filter == 1) {
                         loc_screen_px: gl.get_uniform_location(prog, "u_screen_px"),
                         loc_font: gl.get_uniform_location(prog, "u_font"),
                         loc_back: gl.get_uniform_location(prog, "u_back"),
-                        loc_filter: gl.get_uniform_location(prog, "u_filter"),
                         prog,
                         vao,
                         vbo,
@@ -216,7 +199,6 @@ if (u_filter == 1) {
                     info: &egui::PaintCallbackInfo,
                     verts: &[Vertex],
                     tex_id: TextureId,
-                    filter: Filter,
                 ) {
                     let Some(font_tex) = painter.texture(tex_id) else {
                         eprintln!("filter: texture {:?} not found", tex_id);
@@ -249,7 +231,6 @@ if (u_filter == 1) {
                     gl.uniform_2_f32(self.loc_screen_px.as_ref(), sw as f32, sh as f32);
                     gl.uniform_1_i32(self.loc_font.as_ref(), 0);
                     gl.uniform_1_i32(self.loc_back.as_ref(), 1);
-                    gl.uniform_1_i32(self.loc_filter.as_ref(), filter as i32);
 
                     gl.disable(glow::BLEND);
                     gl.bind_vertex_array(Some(self.vao));
@@ -276,8 +257,8 @@ if (u_filter == 1) {
             }
 
             impl FilterPass {
-                pub fn paint(&self, ui: &Ui, batch: FilterBatch, filter: Filter) {
-                    if batch.is_empty() {
+                pub fn paint(&self, ui: &Ui, batch: FilterBatch) {
+                    if batch.len() == 0 {
                         return;
                     }
                     let verts = Arc::new(batch.verts);
@@ -287,7 +268,7 @@ if (u_filter == 1) {
                         let gl: &glow::Context = &**painter.gl();
                         let mut guard = state.lock().unwrap();
                         let st = guard.get_or_insert_with(|| unsafe { GlState::new(gl) });
-                        unsafe { st.draw(gl, painter, &info, &verts, tex_id, filter) };
+                        unsafe { st.draw(gl, painter, &info, &verts, tex_id) };
                     });
                     ui.painter().add(egui::Shape::Callback(egui::PaintCallback {
                         rect: ui.ctx().screen_rect(),

@@ -20,9 +20,6 @@ pub struct Item {
     pub aspect: f32,
     /// Original pixel area. <= 1.0 means "unknown" (folders etc.) and gets weight 1.
     pub area: f32,
-    pub height: f32,
-    pub seed: u64,
-    pub flexible: bool,
 }
 
 pub struct Params {

@@ -1,5 +1,6 @@
 mod actions;
 mod app;
+mod drag_source;
 mod filter;
 mod gallery;
 mod file_manager;
@@ -11,8 +12,18 @@ mod window;
 mod x11;
 
 use app::SymtropyApp;
+use std::sync::OnceLock;
+use std::time::Instant;
+
+static PROCESS_START: OnceLock<Instant> = OnceLock::new();
+
+pub(crate) fn startup_ms() -> u128 {
+    PROCESS_START.get_or_init(Instant::now).elapsed().as_millis()
+}
 
 fn main() -> eframe::Result<()> {
+    PROCESS_START.get_or_init(Instant::now);
+    eprintln!("startup: process start @ {}ms", startup_ms());
     // Force X11/XWayland so our _GTK_FRAME_EXTENTS tiling hack works. winit 0.29 picks native
     // Wayland whenever WAYLAND_DISPLAY is set (it no longer reads WINIT_UNIX_BACKEND), so hide it.
     // This must run before anything else touches the environment or spawns a thread.
@@ -43,6 +54,10 @@ fn main() -> eframe::Result<()> {
     eframe::run_native(
         "Symtropy",
         options,
-        Box::new(move |cc| Box::new(SymtropyApp::new(cc, library, explicit_library))),
+        Box::new(move |cc| {
+            let app = SymtropyApp::new(cc, library, explicit_library);
+            eprintln!("startup: app created @ {}ms", startup_ms());
+            Box::new(app)
+        }),
     )
 }

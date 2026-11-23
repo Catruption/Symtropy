@@ -1,10 +1,10 @@
-use crate::actions::{self, Action, ClipboardMode, ContextTarget, MenuOptions};
+use crate::actions::{self, Action, ClipboardMode, ContextTarget, MenuOptions, TagDialog};
 use crate::theme::Theme;
 use crate::x11::X11Window;
 use crate::gallery::{GalleryState, frame_from_time, Sidecar};
-use crate::sidebar::{FilterPreset, FilterQuery, SidebarAction};
+use crate::sidebar::FilterQuery;
 use crate::file_manager::{self, FileManagerState, SortDirection, ViewMode};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::io::{Read as _, Seek as _};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant, UNIX_EPOCH};
@@ -34,9 +34,6 @@ struct FolderViewMemory {
     grid_scale: Option<f32>,
     list_scroll_offset: Option<f32>,
     gallery_scroll_offset: Option<f32>,
-    query_input: Option<String>,
-    active_query: Option<String>,
-    active_tags: Vec<String>,
 }
 
 struct SlideshowState {
@@ -64,8 +61,6 @@ struct SavedState {
     button_scale: Option<f32>,
     recent_dirs: Vec<PathBuf>,
     folder_views: HashMap<String, FolderViewMemory>,
-    query_history: Vec<String>,
-    filter_presets: Vec<FilterPreset>,
 }
 
 fn fnv1a(bytes: &[u8], seed: u64) -> u64 {
@@ -169,6 +164,31 @@ fn find_duplicate_groups(dir: &Path) -> Vec<Vec<PathBuf>> {
     }
     groups.sort();
     groups
+}
+
+/// Absolute, lexically normalised form of a directory path. A relative launch argument or a
+/// relative saved path would otherwise leave `current_dir` relative, so the parent button,
+/// path bar ancestors and history only resolve from one working directory.
+fn absolute_dir(path: PathBuf) -> PathBuf {
+    use std::path::Component;
+    let absolute = if path.is_absolute() {
+        path
+    } else {
+        std::env::current_dir().map(|cwd| cwd.join(&path)).unwrap_or(path)
+    };
+    let mut out = PathBuf::new();
+    for component in absolute.components() {
+        match component {
+            Component::CurDir => {}
+            Component::ParentDir => {
+                if matches!(out.components().next_back(), Some(Component::Normal(_))) {
+                    out.pop();
+                }
+            }
+            other => out.push(other.as_os_str()),
+        }
+    }
+    if out.as_os_str().is_empty() { PathBuf::from("/") } else { out }
 }
 
 fn folder_key(path: &Path) -> String {
@@ -318,14 +338,92 @@ enum Dialog {
     NewFile { dir: PathBuf, text: String },
     Properties { paths: Vec<PathBuf> },
     EditTag { paths: Vec<PathBuf>, remove: bool, text: String },
+    Tag { kind: TagDialog, text: String },
     Duplicates { groups: Vec<Vec<PathBuf>> },
+}
+
+fn dedup_tags(tags: Vec<String>) -> Vec<String> {
+    let mut seen = HashSet::new();
+    tags.into_iter().filter(|tag| seen.insert(tag.clone())).collect()
+}
+
+/// Rewrite one tag's name, its subtree's ancestor chain, and every per-image
+/// parent link in a sidecar. `to` is `None` when the tag is deleted.
+fn remap_subtree_in_sidecar(
+    sc: &mut Sidecar,
+    descendants: &HashSet<String>,
+    from: &str,
+    to: Option<&str>,
+    old_chain: &[String],
+    new_chain: &[String],
+) -> bool {
+    if !sc.tags.iter().any(|tag| descendants.contains(tag)) {
+        return false;
+    }
+
+    let before_tags = sc.tags.clone();
+    let before_links = sc.tag_parents.clone();
+
+    let mut tags = Vec::with_capacity(sc.tags.len() + new_chain.len());
+    for tag in sc.tags.drain(..) {
+        if tag == from {
+            if let Some(replacement) = to {
+                tags.push(replacement.to_string());
+            }
+        } else if descendants.contains(&tag)
+            || new_chain.contains(&tag)
+            || !old_chain.contains(&tag)
+        {
+            tags.push(tag);
+        }
+    }
+    for ancestor in new_chain {
+        if !tags.contains(ancestor) {
+            tags.push(ancestor.clone());
+        }
+    }
+    sc.tags = dedup_tags(tags);
+
+    let mut links = std::mem::take(&mut sc.tag_parents);
+    links.retain(|child, parent| {
+        let child_stale = old_chain.contains(child)
+            && !new_chain.contains(child)
+            && Some(child.as_str()) != to;
+        let parent_stale = old_chain.contains(parent)
+            && !new_chain.contains(parent)
+            && Some(parent.as_str()) != to;
+        !child_stale && !parent_stale && child != parent
+    });
+
+    let mut remapped = HashMap::with_capacity(links.len() + new_chain.len() + 1);
+    for (child, parent) in links {
+        let child = if child == from { to.map(str::to_string) } else { Some(child) };
+        let parent = if parent == from { to.map(str::to_string) } else { Some(parent) };
+        if let (Some(child), Some(parent)) = (child, parent) {
+            if child != parent {
+                remapped.insert(child, parent);
+            }
+        }
+    }
+    for pair in new_chain.windows(2) {
+        remapped.insert(pair[1].clone(), pair[0].clone());
+    }
+    if let Some(tag) = to {
+        if let Some(parent) = new_chain.last() {
+            remapped.insert(tag.to_string(), parent.clone());
+        } else {
+            remapped.remove(tag);
+        }
+    }
+    sc.tag_parents = remapped;
+
+    before_tags != sc.tags || before_links != sc.tag_parents
 }
 
 pub struct SymtropyApp {
     theme: Theme,
     frames: u32,
     x11: Option<X11Window>,
-    last_regions: Vec<[i32; 4]>,
     last_overhang_px: u32,
     last_persisted_frame_scale: f32,
     last_persisted_button_scale: f32,
@@ -344,6 +442,7 @@ pub struct SymtropyApp {
     viewer_show_sidebar: bool,
     viewer_sidebar_width: f32,
     viewer_needs_fit: bool,
+    viewer_last_fit_size: Option<egui::Vec2>,
     video_memory: HashMap<String, VideoPlaybackMemory>,
     video_volume: f32,
     video_muted: bool,
@@ -361,8 +460,6 @@ pub struct SymtropyApp {
     redo_stack: Vec<UndoOp>,
     recent_dirs: Vec<PathBuf>,
     folder_views: HashMap<String, FolderViewMemory>,
-    query_history: Vec<String>,
-    filter_presets: Vec<FilterPreset>,
     slideshow: Option<SlideshowState>,
     dialog: Option<Dialog>,
     status: Option<String>,
@@ -388,6 +485,7 @@ impl SymtropyApp {
         .filter(|p| p.is_dir())
         .or_else(|| saved.current_dir.clone().filter(|p| p.exists()))
         .unwrap_or(default_library);
+        let initial_dir = absolute_dir(initial_dir);
 
         let mut fm = FileManagerState::new(initial_dir);
         fm.view_mode = parse_view_mode(saved.view_mode.as_deref()).unwrap_or(ViewMode::Gallery);
@@ -417,11 +515,6 @@ impl SymtropyApp {
         if let (Some(g), Some(view)) = (gallery.as_mut(), initial_view.as_ref()) {
             if let Some(scale) = view.grid_scale { g.grid_scale = scale; }
             if let Some(offset) = view.gallery_scroll_offset { g.scroll_offset = offset; }
-            if let Some(input) = &view.query_input { g.query_input = input.clone(); }
-            if let Some(query) = &view.active_query {
-                g.active_query = crate::gallery::Query::parse(query).unwrap_or(crate::gallery::Query::AlwaysTrue);
-            }
-            g.active_tags = view.active_tags.iter().cloned().collect();
         }
         if let Some(g) = gallery.as_mut() {
             g.set_sort(fm.sort, fm.sort_direction);
@@ -435,13 +528,14 @@ impl SymtropyApp {
 
         let mut app = Self {
             theme,
-            frames: 0, x11: None, last_regions: Vec::new(), last_overhang_px: 0,
+            frames: 0, x11: None, last_overhang_px: 0,
             last_persisted_frame_scale: frame_scale, last_persisted_button_scale: button_scale,
             fm, gallery,
             viewer_open: false, viewer_cache: HashMap::new(), viewer_player: None,
             viewer_loaded_path: None, viewer_zoom: 1.0, viewer_pan: egui::Vec2::ZERO,
             viewer_anim_frames: Vec::new(), viewer_anim_durations: Vec::new(),
             viewer_show_sidebar: true, viewer_sidebar_width: 500.0, viewer_needs_fit: false,
+            viewer_last_fit_size: None,
             video_memory: saved.video_positions.unwrap_or_default(),
             video_volume: saved.video_volume.unwrap_or(1.0),
             video_muted: saved.video_muted.unwrap_or(false),
@@ -454,13 +548,17 @@ impl SymtropyApp {
             undo_stack: Vec::new(), redo_stack: Vec::new(),
             recent_dirs: saved.recent_dirs.into_iter().filter(|p| p.is_dir()).take(20).collect(),
             folder_views: saved.folder_views,
-            query_history: saved.query_history.into_iter().take(20).collect(),
-            filter_presets: saved.filter_presets,
             slideshow: None,
             dialog: None, status: None,
         };
         let current = app.fm.current_dir.clone();
         app.remember_recent_dir(&current);
+        if let Ok(target) = std::env::var("SYMTROPY_OPEN_VIEWER") {
+            app.viewer_open = true;
+            if let Some(g) = app.gallery.as_mut() {
+                g.viewer_target = Some(target);
+            }
+        }
         app
     }
 
@@ -493,8 +591,6 @@ impl SymtropyApp {
             button_scale: Some(self.theme.button_scale_setting()),
             recent_dirs: self.recent_dirs.clone(),
             folder_views,
-            query_history: self.query_history.clone(),
-            filter_presets: self.filter_presets.clone(),
         }
         .save();
     }
@@ -526,13 +622,31 @@ impl SymtropyApp {
         saved.save();
     }
 
+    /// Re-read the current directory after a file operation. This is the same
+    /// directory, so the query stays, but *every* piece of view state must be
+    /// carried over -- replacing the gallery with a pristine one used to reset
+    /// zoom, scroll and selection, which then got snapshotted into folder
+    /// memory and looked like a stale view when navigating back.
     fn rescan_gallery(&mut self, ctx: &egui::Context) {
-        if self.fm.view_mode == ViewMode::Gallery {
-            self.gallery = Some(GalleryState::scan_dir(ctx, &self.fm.current_dir));
-            if let Some(g) = self.gallery.as_mut() {
-                g.set_sort(self.fm.sort, self.fm.sort_direction);
-            }
+        self.path_bar.invalidate_counts();
+        if self.fm.view_mode != ViewMode::Gallery {
+            return;
         }
+        let previous = self.gallery.take();
+        let mut gallery = GalleryState::scan_dir(ctx, &self.fm.current_dir);
+        if let Some(old) = previous {
+            gallery.active_query = old.active_query;
+            gallery.query_error = old.query_error;
+            gallery.grid_scale = old.grid_scale;
+            gallery.scroll_offset = old.scroll_offset;
+            gallery.selected_images = old.selected_images;
+            gallery.selection_anchor = old.selection_anchor;
+            gallery.keyboard_focus = old.keyboard_focus;
+            gallery.viewer_target = old.viewer_target;
+            gallery.tag_search_query = old.tag_search_query;
+        }
+        gallery.set_sort(self.fm.sort, self.fm.sort_direction);
+        self.gallery = Some(gallery);
     }
 
     fn snapshot_current_view(&self) -> FolderViewMemory {
@@ -547,22 +661,8 @@ impl SymtropyApp {
         if let Some(g) = &self.gallery {
             view.grid_scale = Some(g.grid_scale);
             view.gallery_scroll_offset = Some(g.scroll_offset);
-            view.query_input = Some(g.query_input.clone());
-            view.active_query = Some(g.active_query.to_string());
-            view.active_tags = g.active_tags.iter().cloned().collect();
         }
         view
-    }
-
-    fn remember_query(&mut self, query: &str) {
-        let query = query.trim().to_string();
-        if query.is_empty() {
-            return;
-        }
-        self.query_history.retain(|q| q != &query);
-        self.query_history.insert(0, query);
-        self.query_history.truncate(20);
-        self.persist_state();
     }
 
     fn remember_recent_dir(&mut self, path: &Path) {
@@ -578,6 +678,9 @@ impl SymtropyApp {
         self.viewer_open = false;
         self.slideshow = None;
         self.status = None;
+        // Filters are per-view and deliberately never persisted or carried
+        // across folders, including the sidebar's typed expression.
+        self.filter_query = FilterQuery::default();
 
         if let Some(view) = saved_view {
             if let Some(mode) = parse_view_mode(view.view_mode.as_deref()) {
@@ -596,16 +699,14 @@ impl SymtropyApp {
             }
         }
 
+        // Filters belong to the folder being viewed, never to the app. Copying
+        // the outgoing query here made every path-bar jump inherit the previous
+        // folder's filter, so the destination looked empty or "broken".
         self.gallery = if self.fm.view_mode == ViewMode::Gallery {
             let mut g = GalleryState::scan_dir(ctx, &self.fm.current_dir);
             if let Some(view) = saved_view {
                 if let Some(scale) = view.grid_scale { g.grid_scale = scale; }
                 if let Some(offset) = view.gallery_scroll_offset { g.scroll_offset = offset; }
-                if let Some(input) = &view.query_input { g.query_input = input.clone(); }
-                if let Some(query) = &view.active_query {
-                    g.active_query = crate::gallery::Query::parse(query).unwrap_or(crate::gallery::Query::AlwaysTrue);
-                }
-                g.active_tags = view.active_tags.iter().cloned().collect();
             }
             g.set_sort(self.fm.sort, self.fm.sort_direction);
             Some(g)
@@ -619,7 +720,15 @@ impl SymtropyApp {
     /// Navigate once, preserving the view of the folder being left and restoring the
     /// saved view of the destination. All fresh navigation entry points funnel through here.
     fn navigate_to(&mut self, ctx: &egui::Context, path: PathBuf) {
+        // Relative targets are resolved against the folder being viewed, never the process's
+        // launch directory, and a failed navigation is no longer completely silent.
+        let path = if path.is_absolute() {
+            path
+        } else {
+            absolute_dir(self.fm.current_dir.join(&path))
+        };
         if !path.is_dir() {
+            eprintln!("navigate: '{}' is not a directory", path.display());
             return;
         }
         let from = self.fm.current_dir.clone();
@@ -747,6 +856,233 @@ impl SymtropyApp {
             tag,
             changed
         ));
+    }
+
+    /// Bulk-rewrite sidecars with the same save + index pattern as tag edits.
+    fn rewrite_sidecars<F>(&mut self, transform: F) -> usize
+    where
+        F: Fn(&mut Sidecar) -> bool,
+    {
+        let paths: Vec<PathBuf> = self
+            .gallery
+            .as_ref()
+            .map(|g| {
+                g.items
+                    .iter()
+                    .filter(|item| !item.is_folder)
+                    .map(|item| PathBuf::from(&item.path))
+                    .collect()
+            })
+            .unwrap_or_default();
+        let root = self
+            .gallery
+            .as_ref()
+            .and_then(|g| g.tags_path.parent().map(Path::to_path_buf))
+            .unwrap_or_else(|| self.fm.current_dir.clone());
+        let index_path = crate::gallery::workers::cache_dir().join("index.tsv");
+
+        let mut local_changed = 0;
+        for path in paths {
+            let mut sc = self.sidecar_for_path(&path);
+            if !transform(&mut sc) {
+                continue;
+            }
+            if sc.save(&path).is_err() {
+                continue;
+            }
+            self.sync_sidecar_into_gallery(&path, &sc);
+            crate::gallery::workers::update_index_entry(&index_path, &path.to_string_lossy(), &sc);
+            local_changed += 1;
+        }
+
+        // Tags are global: rewrite every halo sidecar under the library root so
+        // warm launches of other folders do not resurrect the old name.
+        let global_changed =
+            crate::gallery::workers::rewrite_tag_metadata(&root, &index_path, &transform);
+        global_changed.max(local_changed)
+    }
+
+    fn refresh_filter_after_tag(&mut self, from: &str, to: Option<&str>) {
+        let from_key = crate::gallery::hierarchy::tag_key(from);
+        let to_key = to.map(crate::gallery::hierarchy::tag_key);
+        let rewritten = crate::sidebar::replace_filter_token(
+            &self.filter_query.filter,
+            &from_key,
+            to_key.as_deref(),
+        );
+        if let Some(g) = &mut self.gallery {
+            let from_key = from_key.clone();
+            let to_key = to_key.clone();
+            g.active_query = g.active_query.map_tags(&|tag| {
+                if crate::gallery::hierarchy::tag_key(tag) == from_key {
+                    to_key.clone()
+                } else {
+                    Some(tag.to_string())
+                }
+            });
+            g.query_error = None;
+            if crate::gallery::Query::parse(&rewritten).is_ok() {
+                self.filter_query.filter = rewritten;
+            } else {
+                // Removing a tag can leave a dangling operator. The active
+                // query AST is still valid, so rebuild the text from it.
+                self.filter_query.filter = g.active_query.to_string();
+                self.filter_query.rating_min = None;
+            }
+        } else {
+            self.filter_query.filter = rewritten;
+        }
+    }
+
+    fn perform_tag_dialog(&mut self, kind: TagDialog, text: String) {
+        let Some(g) = self.gallery.as_mut() else {
+            self.set_status("Open a gallery folder to manage tags");
+            return;
+        };
+
+        match kind {
+            TagDialog::New { parent } => {
+                let name = text.trim().to_string();
+                if let Err(error) = g.hierarchy.insert(&name, parent.as_deref()) {
+                    self.set_status(format!("Cannot create tag: {}", error));
+                    return;
+                }
+                if let Err(error) = g.commit_tag_hierarchy() {
+                    self.set_status(format!("Tag created but tags.txt could not be written: {}", error));
+                } else {
+                    self.set_status(format!("Created tag '{}'", name));
+                }
+                return;
+            }
+            TagDialog::Rename { tag } => {
+                let new_name = text.trim().to_string();
+                let old_chain = g.hierarchy.ancestors_of(&tag);
+                let descendants: HashSet<String> = g.hierarchy.descendants_of(&tag).into_iter().collect();
+                if let Err(error) = g.hierarchy.rename(&tag, &new_name) {
+                    self.set_status(format!("Cannot rename tag: {}", error));
+                    return;
+                }
+                let changed = self.rewrite_sidecars(|sc| {
+                    remap_subtree_in_sidecar(
+                        sc, &descendants, &tag, Some(&new_name), &old_chain, &old_chain,
+                    )
+                });
+                if let Some(sc) = &mut self.staged_sidecar {
+                    remap_subtree_in_sidecar(
+                        sc, &descendants, &tag, Some(&new_name), &old_chain, &old_chain,
+                    );
+                }
+                self.refresh_filter_after_tag(&tag, Some(&new_name));
+                if let Some(g) = &mut self.gallery {
+                    if let Err(error) = g.commit_tag_hierarchy() {
+                        self.set_status(format!("Tag renamed but tags.txt could not be written: {}", error));
+                        return;
+                    }
+                }
+                self.set_status(format!("Renamed '{}' to '{}' on {} image(s)", tag, new_name, changed));
+            }
+            TagDialog::Move { tag } => {
+                let parent_name = text.trim();
+                let new_parent = if parent_name.is_empty() { None } else { Some(parent_name) };
+                let old_chain = g.hierarchy.ancestors_of(&tag);
+                let descendants: HashSet<String> = g.hierarchy.descendants_of(&tag).into_iter().collect();
+                let new_chain: Vec<String> = match &new_parent {
+                    Some(parent) => {
+                        let mut chain = g.hierarchy.ancestors_of(parent);
+                        chain.push(parent.to_string());
+                        chain
+                    }
+                    None => Vec::new(),
+                };
+                if let Err(error) = g.hierarchy.move_tag(&tag, new_parent.as_deref()) {
+                    self.set_status(format!("Cannot move tag: {}", error));
+                    return;
+                }
+                let changed = self.rewrite_sidecars(|sc| {
+                    remap_subtree_in_sidecar(
+                        sc, &descendants, &tag, Some(&tag), &old_chain, &new_chain,
+                    )
+                });
+                if let Some(sc) = &mut self.staged_sidecar {
+                    remap_subtree_in_sidecar(sc, &descendants, &tag, Some(&tag), &old_chain, &new_chain);
+                }
+                if let Some(g) = &mut self.gallery {
+                    if let Err(error) = g.commit_tag_hierarchy() {
+                        self.set_status(format!("Tag moved but tags.txt could not be written: {}", error));
+                        return;
+                    }
+                }
+                self.set_status(format!(
+                    "Moved '{}' under {} on {} image(s)",
+                    tag,
+                    new_parent.as_deref().unwrap_or("the top level"),
+                    changed
+                ));
+            }
+            TagDialog::Merge { source } => {
+                let target = text.trim().to_string();
+                let old_chain = g.hierarchy.ancestors_of(&source);
+                let descendants: HashSet<String> = g.hierarchy.descendants_of(&source).into_iter().collect();
+                let new_chain = {
+                    let mut chain = g.hierarchy.ancestors_of(&target);
+                    chain.push(target.clone());
+                    chain
+                };
+                if let Err(error) = g.hierarchy.merge(&source, &target) {
+                    self.set_status(format!("Cannot merge tags: {}", error));
+                    return;
+                }
+                let changed = self.rewrite_sidecars(|sc| {
+                    remap_subtree_in_sidecar(
+                        sc, &descendants, &source, Some(&target), &old_chain, &new_chain,
+                    )
+                });
+                if let Some(sc) = &mut self.staged_sidecar {
+                    remap_subtree_in_sidecar(
+                        sc, &descendants, &source, Some(&target), &old_chain, &new_chain,
+                    );
+                }
+                self.refresh_filter_after_tag(&source, Some(&target));
+                if let Some(g) = &mut self.gallery {
+                    if let Err(error) = g.commit_tag_hierarchy() {
+                        self.set_status(format!("Tags merged but tags.txt could not be written: {}", error));
+                        return;
+                    }
+                }
+                self.set_status(format!("Merged '{}' into '{}' on {} image(s)", source, target, changed));
+            }
+            TagDialog::Delete { tag } => {
+                let old_chain = g.hierarchy.ancestors_of(&tag);
+                let parent = g.hierarchy.parent_of(&tag);
+                let new_chain: Vec<String> = match &parent {
+                    Some(p) => {
+                        let mut chain = g.hierarchy.ancestors_of(p);
+                        chain.push(p.clone());
+                        chain
+                    }
+                    None => Vec::new(),
+                };
+                let descendants: HashSet<String> = g.hierarchy.descendants_of(&tag).into_iter().collect();
+                if let Err(error) = g.hierarchy.delete(&tag) {
+                    self.set_status(format!("Cannot delete tag: {}", error));
+                    return;
+                }
+                let changed = self.rewrite_sidecars(|sc| {
+                    remap_subtree_in_sidecar(sc, &descendants, &tag, None, &old_chain, &new_chain)
+                });
+                if let Some(sc) = &mut self.staged_sidecar {
+                    remap_subtree_in_sidecar(sc, &descendants, &tag, None, &old_chain, &new_chain);
+                }
+                self.refresh_filter_after_tag(&tag, None);
+                if let Some(g) = &mut self.gallery {
+                    if let Err(error) = g.commit_tag_hierarchy() {
+                        self.set_status(format!("Tag deleted but tags.txt could not be written: {}", error));
+                        return;
+                    }
+                }
+                self.set_status(format!("Deleted '{}' from {} image(s)", tag, changed));
+            }
+        }
     }
 
     fn record_op(&mut self, op: UndoOp) {
@@ -980,6 +1316,35 @@ impl SymtropyApp {
                 self.dialog = Some(Dialog::EditTag { paths, remove, text: String::new() });
             }
             Action::ApplyTag { paths, tag, remove } => self.apply_tag_for_paths(&paths, &tag, remove),
+            Action::ApplyTagToSelected { tag, remove } => {
+                let paths = self.selected_paths();
+                self.apply_tag_for_paths(&paths, &tag, remove);
+            }
+            Action::ApplyTagFilter(token) => {
+                match crate::gallery::Query::parse(&token) {
+                    Ok(parsed) => {
+                        self.filter_query.filter = token.clone();
+                        self.filter_query.rating_min = None;
+                        if let Some(g) = &mut self.gallery {
+                            g.active_query = parsed;
+                            g.query_error = None;
+                        }
+                        self.viewer_open = false;
+                        self.slideshow = None;
+                        self.set_status(format!("Filter applied: {}", token));
+                    }
+                    Err(error) => self.set_status(format!("Invalid filter: {}", error)),
+                }
+            }
+            Action::TagDialog(kind) => {
+                let text = match &kind {
+                    TagDialog::Rename { tag } => tag.clone(),
+                    TagDialog::Delete { tag } => tag.clone(),
+                    _ => String::new(),
+                };
+                self.dialog = Some(Dialog::Tag { kind, text });
+            }
+            Action::TagCommit { kind, text } => self.perform_tag_dialog(kind, text),
             Action::FindDuplicates => {
                 let groups = find_duplicate_groups(&self.fm.current_dir);
                 if groups.is_empty() {
@@ -1092,6 +1457,13 @@ impl SymtropyApp {
                     g.selection_anchor = None;
                 }
             }
+            Action::ClearFilters => {
+                self.filter_query = FilterQuery::default();
+                if let Some(g) = &mut self.gallery {
+                    g.clear_filters();
+                }
+                self.set_status("Filters cleared");
+            }
             Action::SetSort { key, descending } => {
                 let direction = if descending {
                     SortDirection::Descending
@@ -1145,11 +1517,24 @@ impl SymtropyApp {
             Dialog::NewFile { .. } => "New File",
             Dialog::Properties { .. } => "Properties",
             Dialog::EditTag { remove, .. } => if *remove { "Remove Tag" } else { "Add Tag" },
+            Dialog::Tag { kind, .. } => match kind {
+                TagDialog::New { parent: Some(_) } => "New Child Tag",
+                TagDialog::New { parent: None } => "New Top-Level Tag",
+                TagDialog::Rename { .. } => "Rename Tag",
+                TagDialog::Move { .. } => "Move Tag",
+                TagDialog::Merge { .. } => "Merge Tags",
+                TagDialog::Delete { .. } => "Delete Tag",
+            },
             Dialog::Duplicates { .. } => "Duplicate Files",
         };
         let mut close = false;
         let mut submit: Option<Action> = None;
         let new_is_dir = matches!(dialog, Dialog::NewFolder { .. });
+        let tag_catalog: Vec<String> = self
+            .gallery
+            .as_ref()
+            .map(|g| crate::sidebar::tag_catalog(&g.tag_tree))
+            .unwrap_or_default();
 
         let response = egui::Window::new(title)
             .anchor(egui::Align2::CENTER_CENTER, egui::Vec2::ZERO)
@@ -1223,6 +1608,94 @@ impl SymtropyApp {
                             if ui.button("Cancel").clicked() { close = true; }
                         });
                     }
+                    Dialog::Tag { kind, text } => {
+                        let commit_kind = kind.clone();
+                        match &commit_kind {
+                            TagDialog::Delete { tag } => {
+                                ui.label(format!("Delete tag '{}'?", tag));
+                                ui.label(
+                                    egui::RichText::new("Its child tags will be promoted; images will lose this tag.")
+                                        .small()
+                                        .color(egui::Color32::GRAY),
+                                );
+                                ui.horizontal(|ui| {
+                                    if ui.button("Delete").clicked() {
+                                        submit = Some(Action::TagCommit {
+                                            kind: commit_kind.clone(),
+                                            text: text.clone(),
+                                        });
+                                    }
+                                    if ui.button("Cancel").clicked() { close = true; }
+                                });
+                            }
+                            other => {
+                                let (label, hint, button) = match other {
+                                    TagDialog::New { parent: Some(parent) } => (
+                                        format!("New child tag under '{}':", parent),
+                                        "tag name",
+                                        "Create",
+                                    ),
+                                    TagDialog::New { parent: None } => (
+                                        "New top-level tag:".to_string(),
+                                        "tag name",
+                                        "Create",
+                                    ),
+                                    TagDialog::Rename { tag } => (
+                                        format!("Rename '{}' to:", tag),
+                                        "new tag name",
+                                        "Rename",
+                                    ),
+                                    TagDialog::Move { tag } => (
+                                        format!("Move '{}' under:", tag),
+                                        "parent tag (blank = top level)",
+                                        "Move",
+                                    ),
+                                    TagDialog::Merge { source } => (
+                                        format!("Merge '{}' into:", source),
+                                        "target tag",
+                                        "Merge",
+                                    ),
+                                    TagDialog::Delete { .. } => unreachable!(),
+                                };
+                                ui.label(label);
+                                if matches!(other, TagDialog::Merge { .. }) {
+                                    ui.label(
+                                        egui::RichText::new("Images tagged with the source will be retagged with the target.")
+                                            .small()
+                                            .color(egui::Color32::GRAY),
+                                    );
+                                }
+                                let response = ui.add_sized(
+                                    [ui.available_width().max(260.0), 22.0],
+                                    egui::TextEdit::singleline(text).hint_text(hint),
+                                );
+                                crate::sidebar::show_tag_suggestions(
+                                    ui,
+                                    ui.make_persistent_id("tag_dialog_suggestions"),
+                                    &response,
+                                    text,
+                                    &tag_catalog,
+                                    false,
+                                    &[],
+                                );
+                                ui.horizontal(|ui| {
+                                    let commit = ui.button(button).clicked()
+                                        || (response.lost_focus()
+                                            && ui.input(|i| i.key_pressed(egui::Key::Enter)));
+                                    // A blank parent is a valid Move target (top level).
+                                    let has_text = !text.trim().is_empty();
+                                    let valid = has_text || matches!(other, TagDialog::Move { .. });
+                                    if commit && valid {
+                                        submit = Some(Action::TagCommit {
+                                            kind: commit_kind.clone(),
+                                            text: text.trim().to_string(),
+                                        });
+                                    }
+                                    if ui.button("Cancel").clicked() { close = true; }
+                                });
+                            }
+                        }
+                    }
                     Dialog::Duplicates { groups } => {
                         ui.label(format!("{} groups of identical files", groups.len()));
                         egui::ScrollArea::vertical().max_height(360.0).show(ui, |ui| {
@@ -1266,7 +1739,14 @@ impl eframe::App for SymtropyApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         let ppp = ctx.pixels_per_point();
         self.theme.sync_scale(ppp, ctx.screen_rect().size());
-        let overhang_px = (crate::window::overhang(&self.theme) * ppp).round() as u32;
+        let fullscreen = ctx.input(|i| i.viewport().fullscreen.unwrap_or(false));
+        // In true fullscreen the WM ignores frame extents and the plate fills the viewport.
+        // Reporting an extent there used to disagree with the chrome geometry.
+        let overhang_px = if fullscreen {
+            0
+        } else {
+            (crate::window::overhang(&self.theme) * ppp).round() as u32
+        };
 
         if ctx.input(|i| i.key_pressed(egui::Key::L) && i.modifiers.ctrl) {
             let dir = self.fm.current_dir.clone();
@@ -1274,6 +1754,9 @@ impl eframe::App for SymtropyApp {
         }
 
         self.frames += 1;
+        if self.frames == 1 {
+            eprintln!("startup: first frame / window ready @ {}ms", crate::startup_ms());
+        }
         if self.x11.is_none() && self.frames < 600 {
             if self.frames % 10 == 0 {
                 if let Some(x) = X11Window::find() {
@@ -1308,6 +1791,14 @@ impl eframe::App for SymtropyApp {
         });
         if !dropped.is_empty() {
             fm_actions.push(Action::ImportExternal { paths: dropped, dir: self.fm.current_dir.clone() });
+        }
+
+        // An external XDND target can request DELETE after accepting a plain
+        // (move) drag. The source thread reports those paths back here so the
+        // existing shared action path handles cleanup and status.
+        let external_moves = crate::drag_source::take_external_moves();
+        if !external_moves.is_empty() {
+            fm_actions.push(Action::Trash(external_moves));
         }
 
         // No-icon keyboard shortcuts. They stay out of the way of text fields, dialogs and the
@@ -1351,7 +1842,7 @@ impl eframe::App for SymtropyApp {
             }
         }
 
-        let regions = crate::window::show(ctx, &self.theme, "Symtropy", |ui| {
+        crate::window::show(ctx, &self.theme, "Symtropy", |ui| {
             let max_size = ui.available_size();
 
             ui.allocate_ui_with_layout(
@@ -1495,7 +1986,11 @@ impl eframe::App for SymtropyApp {
                                                                                   .vertical_scroll_offset(self.fm.list_scroll_offset)
                                                                                   .auto_shrink([false, false])
                                                                                   .show(ui, |ui| {
-                                                                                      let bg_resp = ui.interact(ui.clip_rect(), ui.id().with("list_bg"), egui::Sense::click());
+                                                                                      // Bind the background to the list viewport. egui keeps the inherited parent
+                                                                                      // clip when the content is too short to scroll; using that rect here would
+                                                                                      // cover the toolbar/path bar and swallow their clicks in an empty folder.
+                                                                                      let bg_rect = ui.clip_rect().intersect(scroll_rect);
+                                                                                      let bg_resp = ui.interact(bg_rect, ui.id().with("list_bg"), egui::Sense::click());
                                                                                       let bg_dir = self.fm.current_dir.clone();
                                                                                       let options = MenuOptions {
                                                                                           bookmarked: self.fm.bookmarks.paths.contains(&bg_dir),
@@ -1566,6 +2061,17 @@ impl eframe::App for SymtropyApp {
                                                                                                       vec![entry.path.clone()]
                                                                                                   };
                                                                                                   actions::begin_drag(ui, paths);
+                                                                                              }
+                                                                                              Some(actions::Click::PrimaryDrag) => {
+                                                                                                  let paths = if self.fm.selected.contains(&entry.path) && self.fm.selected.len() > 1 {
+                                                                                                      entries.iter()
+                                                                                                      .filter(|e| self.fm.selected.contains(&e.path))
+                                                                                                      .map(|e| e.path.clone())
+                                                                                                      .collect()
+                                                                                                  } else {
+                                                                                                      vec![entry.path.clone()]
+                                                                                                  };
+                                                                                                  actions::begin_external_drag(ui, paths);
                                                                                               }
                                                                                               None => {}
                                                                                           }
@@ -1647,16 +2153,15 @@ impl eframe::App for SymtropyApp {
             if overhang_px != self.last_overhang_px {
                 x.set_frame_extents(overhang_px);
                 self.last_overhang_px = overhang_px;
+                // Frame extents are applied asynchronously by the WM.
+                ctx.request_repaint();
             }
-            let px: Vec<[i32; 4]> = regions.iter().map(|r| {
-                let (x0, y0) = ((r.min.x * ppp).round() as i32, (r.min.y * ppp).round() as i32);
-                let (x1, y1) = ((r.max.x * ppp).round() as i32, (r.max.y * ppp).round() as i32);
-                [x0, y0, x1 - x0, y1 - y0]
-            }).collect();
-            if px != self.last_regions {
-                x.set_input_region(&px);
-                self.last_regions = px;
-            }
+        }
+
+        // Give the WM a short startup window to apply those extents even when
+        // an empty folder would otherwise stop repainting immediately.
+        if self.frames < 120 {
+            ctx.request_repaint();
         }
 
         if self.viewer_open {
@@ -1692,12 +2197,10 @@ impl eframe::App for SymtropyApp {
                 self.viewer_anim_durations.clear();
                 self.viewer_player = None;
                 self.viewer_needs_fit = true;
+                self.viewer_last_fit_size = None;
 
                 if let Some(gallery) = &self.gallery {
                     self.staged_sidecar = gallery.items.iter().find(|i| i.path == path).map(|i| i.sidecar.clone());
-                    if let Some(g) = &mut self.gallery {
-                        g.active_tags = self.staged_sidecar.as_ref().map(|sc| sc.tags.iter().cloned().collect()).unwrap_or_default();
-                    }
                 }
 
                 let is_video = crate::gallery::workers::is_video_path(Path::new(&path));
@@ -1712,7 +2215,10 @@ impl eframe::App for SymtropyApp {
                                     let (w, h) = frame.dimensions();
                                     let mut img = image::RgbaImage::from_raw(w, h, frame.data().to_vec()).unwrap();
                                     if w.max(h) > 2048 {
-                                        img = image::imageops::resize(&img, 2048, 2048, image::imageops::FilterType::Lanczos3);
+                                        let scale = 2048.0 / w.max(h) as f32;
+                                        let nw = ((w as f32 * scale) as u32).max(1);
+                                        let nh = ((h as f32 * scale) as u32).max(1);
+                                        img = image::imageops::resize(&img, nw, nh, image::imageops::FilterType::Lanczos3);
                                     }
                                     let ci = egui::ColorImage::from_rgba_unmultiplied([img.width() as usize, img.height() as usize], img.as_raw());
                                     t_frames.push(ctx.load_texture(format!("{}_f{}", path, t_frames.len()), ci, egui::TextureOptions::LINEAR));
@@ -1758,6 +2264,7 @@ impl eframe::App for SymtropyApp {
             let mut show_sidebar = self.viewer_show_sidebar;
             let mut sidebar_width = self.viewer_sidebar_width;
             let mut needs_fit = self.viewer_needs_fit;
+            let mut last_fit_size = self.viewer_last_fit_size;
             let mut video_volume = self.video_volume;
             let mut video_muted = self.video_muted;
             let mut video_loop = self.video_loop;
@@ -1770,23 +2277,17 @@ impl eframe::App for SymtropyApp {
             let mut active_query = self.gallery.as_ref()
             .map(|g| g.active_query.clone())
             .unwrap_or(crate::gallery::Query::AlwaysTrue);
-            let mut query_input = self.gallery.as_ref()
-            .map(|g| g.query_input.clone())
-            .unwrap_or_default();
             let mut query_error = self.gallery.as_ref().and_then(|g| g.query_error.clone());
-            if filter_query.raw_query.is_empty() {
-                filter_query.raw_query = query_input.clone();
-            }
 
-            let (tag_tree, mut active_tags, mut search_query) = if let Some(g) = &self.gallery {
-                (g.tag_tree.clone(), g.active_tags.clone(), g.tag_search_query.clone())
+            let (tag_tree, mut search_query) = if let Some(g) = &self.gallery {
+                (g.tag_tree.clone(), g.tag_search_query.clone())
             } else {
-                (crate::gallery::TagNode { name: "Root".into(), children: vec![] }, Default::default(), String::new())
+                (crate::gallery::TagNode { name: "Root".into(), children: vec![] }, String::new())
             };
 
             let mut apply_clicked = false;
             let mut revert_clicked = false;
-            let mut sidebar_actions: Vec<SidebarAction> = Vec::new();
+            let mut viewer_actions: Vec<Action> = Vec::new();
             let short_name = path.rsplit('/').next().unwrap_or("").to_string();
             let is_video = crate::gallery::workers::is_video_path(Path::new(&path));
 
@@ -1806,6 +2307,11 @@ impl eframe::App for SymtropyApp {
                                                 let actual_sidebar_width = if show_sidebar { sidebar_width } else { 0.0 };
                                                 let img_rect = egui::Rect::from_min_max(rect.min, egui::pos2(rect.max.x - actual_sidebar_width, rect.max.y));
                                                 let sidebar_rect = egui::Rect::from_min_max(egui::pos2(rect.max.x - actual_sidebar_width, rect.min.y), rect.max);
+
+                                                if last_fit_size.map_or(true, |size| (size - img_rect.size()).length() > 0.5) {
+                                                    needs_fit = true;
+                                                    last_fit_size = Some(img_rect.size());
+                                                }
 
                                                 ui.painter().rect_filled(img_rect, 0.0, egui::Color32::from_rgb(15, 15, 20));
                                                 if show_sidebar {
@@ -2029,23 +2535,20 @@ impl eframe::App for SymtropyApp {
                                                 ui.painter().text(toggle_rect.center(), egui::Align2::CENTER_CENTER, toggle_icon, egui::FontId::proportional(18.0), egui::Color32::WHITE);
 
                                                 if show_sidebar {
-                                                    let (apply, revert, actions) = crate::sidebar::draw_sidebar(
+                                                    let (apply, revert) = crate::sidebar::draw_sidebar(
                                                         ui,
                                                         sidebar_rect,
                                                         &mut is_edit_mode,
                                                         &mut staged_sidecar,
                                                         &mut filter_query,
                                                         &tag_tree,
-                                                        &mut active_tags,
                                                         &mut search_query,
                                                         Some(Path::new(&path)),
-                                                        &self.query_history,
-                                                        &self.filter_presets,
                                                         query_error.as_deref(),
+                                                        &mut viewer_actions,
                                                     );
                                                     if apply { apply_clicked = true; }
                                                     if revert { revert_clicked = true; }
-                                                    sidebar_actions.extend(actions);
                                                 }
                                             });
 
@@ -2053,40 +2556,7 @@ impl eframe::App for SymtropyApp {
                                         },
             );
 
-            let state_changed = apply_clicked || revert_clicked || !sidebar_actions.is_empty();
-            for sidebar_action in sidebar_actions {
-                match sidebar_action {
-                    SidebarAction::ApplyQuery(query) => {
-                        match crate::gallery::Query::parse(&query) {
-                            Ok(parsed) => {
-                                active_query = parsed;
-                                query_input = query.clone();
-                                filter_query.raw_query = query.clone();
-                                query_error = None;
-                                self.remember_query(&query);
-                                self.set_status("Filter applied");
-                            }
-                            Err(error) => {
-                                query_error = Some(error.clone());
-                                self.set_status(format!("Invalid query: {}", error));
-                            }
-                        }
-                    }
-                    SidebarAction::SavePreset { name, query } => {
-                        if let Err(error) = crate::gallery::Query::parse(&query) {
-                            query_error = Some(error.clone());
-                            self.set_status(format!("Invalid preset query: {}", error));
-                            continue;
-                        }
-                        query_error = None;
-                        self.filter_presets.retain(|preset| preset.name != name);
-                        self.filter_presets.push(FilterPreset { name: name.clone(), query });
-                        self.filter_presets.truncate(20);
-                        self.persist_state();
-                        self.set_status(format!("Saved preset '{}'", name));
-                    }
-                }
-            }
+            let mut state_changed = apply_clicked || revert_clicked;
 
             if apply_clicked {
                 if is_edit_mode {
@@ -2110,39 +2580,32 @@ impl eframe::App for SymtropyApp {
                                 }
                             }
                         }
+                        if let Some(g) = &mut self.gallery {
+                            g.rebuild_tag_tree();
+                        }
                     }
                 } else {
-                    // A raw query takes precedence; otherwise combine the structured tag and rating fields.
-                    let expression = if !filter_query.raw_query.trim().is_empty() {
-                        filter_query.raw_query.trim().to_string()
-                    } else {
-                        let mut tag_parts = Vec::new();
-                        if !filter_query.tags.trim().is_empty() {
-                            tag_parts.push(filter_query.tags.trim().to_string());
-                        }
-                        let tag_query = tag_parts.join(" + ");
-                        match filter_query.rating_min {
-                            Some(min) => {
-                                let rating = format!("rating:{}+", min);
-                                if tag_query.is_empty() { rating } else { format!("{} + {}", tag_query, rating) }
-                            }
-                            None => tag_query,
-                        }
+                    // One filter field. Rating is just another term in the same expression.
+                    let tags = filter_query.filter.trim();
+                    let expression = match (tags.is_empty(), filter_query.rating_min) {
+                        (true, None) => String::new(),
+                        (true, Some(min)) => format!("rating:{}+", min),
+                        (false, None) => tags.to_string(),
+                        (false, Some(min)) => format!("({}) + rating:{}+", tags, min),
                     };
-                    query_input = expression.clone();
                     match crate::gallery::Query::parse(&expression) {
                         Ok(parsed) => {
                             active_query = parsed;
                             query_error = None;
+                            self.set_status("Filter applied");
+                            // Show the filtered gallery instead of leaving the viewer on top.
+                            still_open = false;
                         }
                         Err(error) => {
                             query_error = Some(error.clone());
-                            self.set_status(format!("Invalid query: {}", error));
-                            active_query = crate::gallery::Query::AlwaysTrue;
+                            self.set_status(format!("Invalid filter: {}", error));
+                            // Keep the last valid filter instead of silently showing everything.
                         }
-                    }
-                    if !expression.is_empty() {
-                        self.remember_query(&expression);
                     }
                 }
             }
@@ -2152,15 +2615,13 @@ impl eframe::App for SymtropyApp {
                     if let Some(g) = &self.gallery {
                         if let Some(item) = g.items.iter().find(|i| i.path == path) {
                             staged_sidecar = Some(item.sidecar.clone());
-                            active_tags = item.tags.clone();
                         }
                     }
                 } else {
                     filter_query = FilterQuery::default();
                     active_query = crate::gallery::Query::AlwaysTrue;
-                    query_input.clear();
                     query_error = None;
-                    eprintln!("gallery: filter cleared");
+                    self.set_status("Filters cleared");
                 }
             }
 
@@ -2171,6 +2632,7 @@ impl eframe::App for SymtropyApp {
             self.viewer_zoom = zoom;
             self.viewer_pan = pan;
             self.viewer_needs_fit = needs_fit;
+            self.viewer_last_fit_size = last_fit_size;
             self.viewer_show_sidebar = show_sidebar;
             self.viewer_sidebar_width = sidebar_width;
             self.is_edit_mode = is_edit_mode;
@@ -2183,12 +2645,24 @@ impl eframe::App for SymtropyApp {
             self.video_muted = video_muted;
             self.video_loop = video_loop;
             if let Some(g) = &mut self.gallery {
-                g.active_tags = active_tags;
                 g.tag_search_query = search_query;
                 g.active_query = active_query;
-                g.query_input = query_input;
                 g.query_error = query_error;
             }
+
+            // Tag-tree menus emit Actions from inside the viewer viewport. Apply
+            // them only after the snapshot above has been written back, so a
+            // rename/merge cannot be overwritten by the viewer's local copies.
+            if !viewer_actions.is_empty() {
+                state_changed = true;
+                for action in viewer_actions {
+                    self.apply_action(ctx, action);
+                }
+                if !self.viewer_open {
+                    still_open = false;
+                }
+            }
+
             if state_changed || video_settings_changed || !still_open {
                 self.persist_state();
             }
@@ -2671,7 +3145,71 @@ mod tests {
         assert!(saved.sort_descending.is_none());
         assert!(saved.folder_views.is_empty());
         assert!(saved.recent_dirs.is_empty());
-        assert!(saved.query_history.is_empty());
-        assert!(saved.filter_presets.is_empty());
+    }
+
+    #[test]
+    fn folder_view_memory_never_stores_active_filters() {
+        let legacy = r#"{"grid_scale":1.5,"query_input":"tag","active_query":"tag","active_tags":["tag"]}"#;
+        let view: FolderViewMemory = serde_json::from_str(legacy).unwrap();
+        assert_eq!(view.grid_scale, Some(1.5));
+
+        let json = serde_json::to_string(&view).unwrap();
+        assert!(!json.contains("query_input"));
+        assert!(!json.contains("active_query"));
+        assert!(!json.contains("active_tags"));
+    }
+
+    #[test]
+    fn subtree_remap_rewrites_sidecar_tags_and_links() {
+        let mut sc = Sidecar::default();
+        sc.tags = vec!["animal".into(), "fox".into(), "fennec".into()];
+        sc.tag_parents.insert("fox".into(), "animal".into());
+        sc.tag_parents.insert("fennec".into(), "fox".into());
+        let descendants: HashSet<String> = ["fox", "fennec"].into_iter().map(str::to_string).collect();
+
+        assert!(remap_subtree_in_sidecar(
+            &mut sc,
+            &descendants,
+            "fox",
+            Some("fox"),
+            &["animal".to_string()],
+            &["creature".to_string()],
+        ));
+        let mut tags = sc.tags.clone();
+        tags.sort();
+        assert_eq!(tags, vec!["creature", "fennec", "fox"]);
+        assert_eq!(sc.tag_parents.get("fox").map(String::as_str), Some("creature"));
+        assert_eq!(sc.tag_parents.get("fennec").map(String::as_str), Some("fox"));
+        assert!(!sc.tag_parents.contains_key("animal"));
+    }
+
+    #[test]
+    fn deleting_a_tag_drops_its_links_but_keeps_descendants() {
+        let mut sc = Sidecar::default();
+        sc.tags = vec!["animal".into(), "fox".into(), "fennec".into()];
+        sc.tag_parents.insert("fox".into(), "animal".into());
+        sc.tag_parents.insert("fennec".into(), "fox".into());
+        let descendants: HashSet<String> = ["fox", "fennec"].into_iter().map(str::to_string).collect();
+
+        assert!(remap_subtree_in_sidecar(
+            &mut sc,
+            &descendants,
+            "fox",
+            None,
+            &["animal".to_string()],
+            &[],
+        ));
+        assert_eq!(sc.tags, vec!["fennec"]);
+        assert!(sc.tag_parents.is_empty());
+    }
+
+    #[test]
+    fn saved_state_never_stores_query_history_or_presets() {
+        let legacy = r#"{"query_history":["cat"],"filter_presets":[{"name":"p","query":"cat"}]}"#;
+        let saved: SavedState = serde_json::from_str(legacy).unwrap();
+
+        let json = serde_json::to_string(&saved).unwrap();
+        assert!(!json.contains("query_history"));
+        assert!(!json.contains("filter_presets"));
     }
 }

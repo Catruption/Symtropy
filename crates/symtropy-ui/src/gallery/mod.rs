@@ -1,7 +1,5 @@
 use egui::TextureHandle;
-use std::collections::hash_map::DefaultHasher;
 use std::collections::{HashMap, HashSet};
-use std::hash::{Hash, Hasher};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::AtomicUsize;
 use std::sync::mpsc::{channel, Receiver};
@@ -27,7 +25,6 @@ pub const MAX_UPLOADS_PER_FRAME: usize = 24;
 pub const MAX_TEXTURES: usize = 400;
 pub const MARGIN: f32 = 0.0;
 pub const TARGET_ROW_HEIGHT: f32 = 200.0;
-pub const SMALL_MAX: f32 = 48.0;
 pub const SCAN_TIMEOUT_SECS: u64 = 1800;
 
 #[derive(Clone, Debug, Default, serde::Serialize, serde::Deserialize)]
@@ -52,11 +49,6 @@ pub struct Margins {
     pub right: u32,
 }
 
-impl Margins {
-    pub fn crop_w(&self) -> u32 { self.left + self.right }
-    pub fn crop_h(&self) -> u32 { self.top + self.bottom }
-}
-
 #[derive(Clone, Debug)]
 pub struct GalleryItem {
     pub id: String,
@@ -65,7 +57,6 @@ pub struct GalleryItem {
     pub is_folder: bool,
     pub ext: String,
     pub aspect_ratio: f32,
-    pub is_animated: bool,
     pub width: f32,
     pub height: f32,
     pub border_colors: BorderColors,
@@ -103,19 +94,12 @@ pub enum ThumbContent {
 pub(crate) struct Thumb {
     pub px: [u32; 2],
     pub content: ThumbContent,
-    pub small: Arc<egui::ColorImage>,
 }
 
 pub(crate) struct LayoutCache {
     pub key: (i32, i32, i32, usize, String),
     pub cells: Vec<layout::Cell>,
     pub total_h: i32,
-}
-
-pub fn seed_of(path: &str) -> u64 {
-    let mut h = DefaultHasher::new();
-    path.hash(&mut h);
-    h.finish()
 }
 
 pub fn frame_from_time(durations: &[f32], elapsed: f64) -> usize {
@@ -167,11 +151,11 @@ pub struct GalleryState {
     pub request_open_viewer: bool,
     pub viewer_target: Option<String>,
     pub tag_tree: TagNode,
-    pub active_tags: HashSet<String>,
     pub tag_search_query: String,
+    pub(crate) tags_text: String,
+    pub(crate) tags_path: PathBuf,
 
     pub hierarchy: Hierarchy,
-    pub query_input: String,
     pub active_query: Query,
     pub query_error: Option<String>,
 
@@ -192,22 +176,81 @@ impl GalleryState {
             .collect()
     }
 
+    /// Drop every active filter without touching selection or view settings.
+    pub fn clear_filters(&mut self) {
+        self.active_query = Query::AlwaysTrue;
+        self.query_error = None;
+    }
+
+    /// Fold sidecar-only tags and their parent links into the taxonomy. The
+    /// tags.txt entries come first so their hierarchy wins on duplicates.
+    pub fn rebuild_tag_tree(&mut self) {
+        let known: HashSet<String> = self
+            .tags_text
+            .lines()
+            .map(str::trim)
+            .filter(|name| !name.is_empty())
+            .map(str::to_string)
+            .collect();
+        let mut extra: HashSet<String> = HashSet::new();
+
+        for item in &self.items {
+            for (child, parent) in &item.sidecar.tag_parents {
+                if child.is_empty() || parent.is_empty() {
+                    continue;
+                }
+                if !known.contains(parent) {
+                    extra.insert(parent.clone());
+                }
+                if !known.contains(child) {
+                    extra.insert(format!("  {}", child));
+                }
+            }
+            for tag in &item.sidecar.tags {
+                if !tag.is_empty() && !known.contains(tag) {
+                    extra.insert(tag.clone());
+                }
+            }
+        }
+
+        let combined = if extra.is_empty() {
+            self.tags_text.clone()
+        } else {
+            let mut lines: Vec<String> = extra.into_iter().collect();
+            lines.sort();
+            format!("{}\n{}\n", self.tags_text, lines.join("\n"))
+        };
+        self.hierarchy = Hierarchy::parse(&combined);
+        self.tag_tree = tree_from_hierarchy(&self.hierarchy);
+    }
+
+    /// Persist the current taxonomy and refresh the sidebar tree from it.
+    pub fn commit_tag_hierarchy(&mut self) -> Result<(), String> {
+        let text = self.hierarchy.to_text();
+        if let Some(parent) = self.tags_path.parent() {
+            std::fs::create_dir_all(parent).map_err(|e| e.to_string())?;
+        }
+        let tmp = self.tags_path.with_extension("txt.tmp");
+        if std::fs::read_to_string(&self.tags_path).ok().as_deref() != Some(text.as_str()) {
+            std::fs::write(&tmp, &text).map_err(|e| e.to_string())?;
+            std::fs::rename(&tmp, &self.tags_path).map_err(|e| e.to_string())?;
+        }
+        self.tags_text = text;
+        self.tag_tree = tree_from_hierarchy(&self.hierarchy);
+        Ok(())
+    }
+
     pub fn scan_dir(ctx: &egui::Context, dir: &Path) -> Self {
         let tags_path = dir
         .parent()
         .map(|p| p.join("tags.txt"))
         .unwrap_or_else(|| std::path::PathBuf::from("tags.txt"));
-        let hierarchy = match std::fs::read_to_string(&tags_path) {
-            Ok(text) => {
-                let h = Hierarchy::parse(&text);
-                eprintln!("gallery: loaded {} tags from {}", h.len(), tags_path.display());
-                h
-            }
-            Err(_) => {
-                eprintln!("gallery: no tag file at {} — tag hierarchy disabled", tags_path.display());
-                Hierarchy::default()
-            }
-        };
+        let tags_text = std::fs::read_to_string(&tags_path).unwrap_or_default();
+        if tags_text.is_empty() {
+            eprintln!("gallery: no tag file at {} — starting from sidecar tags", tags_path.display());
+        }
+        let hierarchy = Hierarchy::parse(&tags_text);
+        eprintln!("gallery: loaded {} tags from {}", hierarchy.len(), tags_path.display());
         let tag_tree = tree_from_hierarchy(&hierarchy);
 
         let cache = workers::cache_dir();
@@ -264,10 +307,10 @@ impl GalleryState {
             request_open_viewer: false,
             viewer_target: None,
             tag_tree,
-            active_tags: HashSet::new(),
             tag_search_query: String::new(),
+            tags_text,
+            tags_path,
             hierarchy,
-            query_input: String::new(),
             active_query: Query::AlwaysTrue,
             query_error: None,
             filter_pass: FilterPass::default(),
@@ -360,8 +403,13 @@ impl GalleryState {
                 }
                 Ok(ScanMsg::Done) => {
                     self.scanning = false;
+                    self.rebuild_tag_tree();
                     self.sort_items();
                     ctx.request_repaint();
+                    eprintln!(
+                        "startup: item list ready @ {}ms ({} items)",
+                        crate::startup_ms(), self.items.len()
+                    );
                 }
                 Err(_) => break,
             }
@@ -370,7 +418,7 @@ impl GalleryState {
         let mut uploads = 0;
         while uploads < MAX_UPLOADS_PER_FRAME {
             match self.result_rx.try_recv() {
-                Ok(Msg::Done { path, px, content, small }) => {
+                Ok(Msg::Done { path, px, content }) => {
                     if self.inflight.get(&path) == Some(&px) {
                         self.inflight.remove(&path);
                     }
@@ -388,7 +436,11 @@ impl GalleryState {
                             ThumbContent::Animated { frames: handles, durations }
                         }
                     };
-                    self.thumbs.insert(path, Thumb { px, content: thumb_content, small });
+                    let first_preview = self.thumbs.is_empty();
+                    self.thumbs.insert(path, Thumb { px, content: thumb_content });
+                    if first_preview {
+                        eprintln!("startup: first preview ready @ {}ms", crate::startup_ms());
+                    }
                     uploads += 1;
                 }
                 Ok(Msg::Skipped { path, px }) => {

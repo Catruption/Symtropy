@@ -209,9 +209,6 @@ impl GalleryState {
                 layout::Item {
                     aspect: if it.is_folder { 1.0 } else { it.aspect_ratio },
                     area: it.width * it.height,
-                    height: it.height,
-                    seed: seed_of(&it.path),
-                 flexible: it.border_colors.is_flexible(),
                 }
             })
             .collect();
@@ -242,7 +239,13 @@ impl GalleryState {
         .show(ui, |ui| {
             // Lowest layer: right-clicking empty space gets a directory menu.
             // Item interactions are registered after this and win on overlap.
-            let bg_resp = ui.interact(ui.clip_rect(), ui.id().with("gallery_bg"), Sense::click());
+            //
+            // Use the ScrollArea viewport, not `ui.clip_rect()`. When there are too few
+            // items to scroll, egui leaves the content clip equal to the parent clip, so
+            // using it here would make this background widget cover the toolbar/path bar
+            // registered earlier and steal all their clicks.
+            let bg_rect = ui.clip_rect().intersect(gallery_rect);
+            let bg_resp = ui.interact(bg_rect, ui.id().with("gallery_bg"), Sense::click());
             let bg_dir = dir.to_path_buf();
             actions::show_menu(
                 ui,
@@ -255,6 +258,8 @@ impl GalleryState {
             let origin = ui.cursor().min;
             let (ox, oy) = ((origin.x * ppp).round() as i32, (origin.y * ppp).round() as i32);
             let visible = ui.clip_rect().expand(600.0);
+            let press_pos = ui.input(|i| i.pointer.press_origin().or_else(|| i.pointer.latest_pos()));
+            let mut pointer_over_item = false;
             let ordered_paths: Vec<String> = filtered
                 .iter()
                 .map(|&i| self.items[i].path.clone())
@@ -266,6 +271,9 @@ impl GalleryState {
                                                vec2(c.w as f32, c.h as f32) / ppp,
                 );
                 if visible.intersects(rect) {
+                    if press_pos.map_or(false, |p| rect.contains(p)) {
+                        pointer_over_item = true;
+                    }
                     let item_idx = filtered[cell_idx];
                     self.draw_item(ui, item_idx, rect, [c.w, c.h], &mut filter_batch, viewer_open, options, &ordered_paths, actions);
                 }
@@ -274,6 +282,13 @@ impl GalleryState {
             // Runs after the items so a drop on a folder wins over the background.
             actions::drop_on_directory(ui, &bg_resp, dir, actions);
 
+            // Double-clicking only the empty area past the previews clears a filter.
+            // Item rects are checked explicitly because the background widget spans
+            // the whole scroll viewport, including the cells drawn on top of it.
+            if !pointer_over_item && matches!(actions::classify(ui, &bg_resp), Some(actions::Click::Double)) {
+                actions.push(Action::ClearFilters);
+            }
+
             ui.allocate_space(vec2(available_width, cache.total_h as f32 / ppp));
         });
         self.scroll_offset = scroll.state.offset.y;
@@ -281,7 +296,7 @@ impl GalleryState {
         self.layout_cache = Some(cache);
         self.flush_requests();
 
-        self.filter_pass.paint(ui, filter_batch, crate::filter::Filter::Invert);
+        self.filter_pass.paint(ui, filter_batch);
 
         if self.grid_scale != 1.0 || ctrl_down {
             let text = format!("Scale: {:.0}%", self.grid_scale * 100.0);
@@ -587,7 +602,9 @@ impl GalleryState {
                 } else {
                     self.selection_anchor = Some(path.clone());
                     self.selected_images = vec![path.clone()];
-                    self.viewer_target = Some(path.clone());
+                    if !self.items[item_idx].is_folder {
+                        self.viewer_target = Some(path.clone());
+                    }
                 }
             }
             Some(actions::Click::Double) => {
@@ -595,8 +612,12 @@ impl GalleryState {
                 if !self.selected_images.contains(&path) {
                     self.selected_images = vec![path.clone()];
                 }
-                self.viewer_target = Some(path.clone());
-                self.request_open_viewer = true;
+                if self.items[item_idx].is_folder {
+                    actions.push(Action::Navigate(PathBuf::from(&path)));
+                } else {
+                    self.viewer_target = Some(path.clone());
+                    self.request_open_viewer = true;
+                }
             }
             Some(actions::Click::Secondary) => {
                 self.keyboard_focus = Some(path.clone());
@@ -613,6 +634,15 @@ impl GalleryState {
                     vec![PathBuf::from(&path)]
                 };
                 actions::begin_drag(ui, paths);
+            }
+            Some(actions::Click::PrimaryDrag) => {
+                self.keyboard_focus = Some(path.clone());
+                let paths: Vec<PathBuf> = if self.selected_images.contains(&path) && self.selected_images.len() > 1 {
+                    self.selected_images.iter().map(PathBuf::from).collect()
+                } else {
+                    vec![PathBuf::from(&path)]
+                };
+                actions::begin_external_drag(ui, paths);
             }
             None => {}
         }
@@ -679,6 +709,32 @@ mod tests {
         let mut batch = crate::filter::FilterBatch::default();
         draw_selection_star(&mut batch, Rect::from_min_size(pos2(0.0, 0.0), vec2(100.0, 100.0)), 3);
         assert_eq!(batch.len(), 10 * 3);
+    }
+
+    #[test]
+    fn empty_scroll_area_background_stays_below_the_toolbar() {
+        // egui leaves the content clip equal to the parent clip when there is not
+        // enough content to scroll. A background widget must additionally be
+        // clipped to the scroll viewport, or it covers the toolbar/path bar
+        // registered earlier and steals every click in an empty folder.
+        let mut observed = None;
+        egui::__run_test_ui(|ui| {
+            let parent = ui.clip_rect();
+            let toolbar = Rect::from_min_size(parent.min, vec2(parent.width(), 36.0));
+            ui.allocate_rect(toolbar, Sense::hover());
+            let viewport = ui.available_rect_before_wrap();
+
+            egui::ScrollArea::vertical()
+                .auto_shrink([false, false])
+                .show(ui, |ui| {
+                    observed = Some((ui.clip_rect(), toolbar, viewport));
+                });
+        });
+
+        let (content_clip, toolbar, viewport) = observed.expect("scroll area closure ran");
+        let bg_rect = content_clip.intersect(viewport);
+        assert!(bg_rect.width() > 0.0 && bg_rect.height() > 0.0);
+        assert!(!bg_rect.intersects(toolbar));
     }
 
     fn cell(x: i32, y: i32, w: i32, h: i32) -> layout::Cell {
