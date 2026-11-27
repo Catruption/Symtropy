@@ -18,7 +18,7 @@ use std::fs;
 use std::path::{Component, Path, PathBuf};
 
 /// Width reserved for the pin / edit / copy / menu buttons.
-const ACTIONS_WIDTH: f32 = 140.0;
+const ACTIONS_WIDTH: f32 = 150.0;
 
 #[derive(Clone, Debug)]
 struct Row {
@@ -33,6 +33,9 @@ struct Row {
 struct SiblingCache {
     parent: PathBuf,
     show_hidden: bool,
+    /// True for the trailing `…` segment, which lists children of the current
+    /// directory instead of siblings of an ancestor.
+    children: bool,
     dirs: Vec<PathBuf>,
 }
 
@@ -317,13 +320,28 @@ pub fn show(
                             .stick_to_right(true)
                             .show(ui, |ui| {
                                 ui.horizontal(|ui| {
-                                    for (index, (label, path)) in segs.iter().enumerate() {
+                                    // One extra trailing segment lets the user step into
+                                    // the next directory without first hovering the
+                                    // current segment and scanning its sibling list.
+                                    for index in 0..=segs.len() {
                                         if index > 0 {
                                             let sep = ui.label(
                                                 RichText::new("/").color(Color32::from_gray(120)),
                                             );
                                             grow(&mut bar_rect, sep.rect);
                                         }
+
+                                        let is_child = index == segs.len();
+                                        let label = if is_child {
+                                            "…"
+                                        } else {
+                                            segs[index].0.as_str()
+                                        };
+                                        let path = if is_child {
+                                            dir.to_path_buf()
+                                        } else {
+                                            segs[index].1.clone()
+                                        };
 
                                         let active = state.open && state.hovered == Some(index);
                                         let color = if active {
@@ -336,9 +354,14 @@ pub fn show(
                                         // The label never changes with hover. Swapping
                                         // in a wider "name ▾" label shifted every segment
                                         // to its right mid-click.
-                                        let text = if index == 0 { "💽".to_string() } else { label.clone() };
+                                        let text = if index == 0 { "💽".to_string() } else { label.to_string() };
                                         let response =
-                                            ui.add(Button::new(RichText::new(text).color(color)).frame(false));
+                                            ui.add(Button::new(RichText::new(text).color(color)).frame(false))
+                                                .on_hover_text(if is_child {
+                                                    "Open subfolders of this directory"
+                                                } else {
+                                                    "Open folders beside this segment"
+                                                });
 
                                         if response.hovered() {
                                             over_segment = true;
@@ -353,8 +376,8 @@ pub fn show(
                                                 state.hovered = Some(index);
                                             }
                                         }
-                                        if response.clicked() {
-                                            actions.push(Action::Navigate(path.clone()));
+                                        if response.clicked() && !is_child {
+                                            actions.push(Action::Navigate(path));
                                             state.close_after_navigate();
                                         }
                                         grow(&mut bar_rect, response.rect);
@@ -366,25 +389,31 @@ pub fn show(
                 );
 
                 ui.add_space(8.0);
-                if ui.small_button("📌").on_hover_text("Keep this folder list open").clicked() {
-                    if state.pinned {
-                        state.close();
-                    } else {
-                        state.pinned = true;
-                        state.open = true;
-                    }
-                }
-                if ui.small_button("✎").on_hover_text("Edit path (Ctrl+L)").clicked() {
-                    state.begin_edit(dir);
-                }
-                if ui.small_button("📋").on_hover_text("Copy directory path").clicked() {
+                // Copy stays visible because it is frequently used. Pin and edit
+                // move into the path menu so the location bar has two controls
+                // instead of four unexplained icons.
+                if ui.small_button("📋 Copy").on_hover_text("Copy this directory path").clicked() {
                     actions.push(Action::CopyPath(dir.to_path_buf()));
                 }
 
                 // One menu button for the hovered segment keeps the path compact
                 // while still exposing the shared file-manager actions.
                 let target = ContextTarget::Background(menu_target.clone());
-                let menu = ui.menu_button("⋯", |ui| {
+                let menu = ui.menu_button("Actions", |ui| {
+                    if ui.button("✎ Edit path (Ctrl+L)").clicked() {
+                        state.begin_edit(dir);
+                        ui.close_menu();
+                    }
+                    if ui.button(if state.pinned { "📌 Unpin folder list" } else { "📌 Keep folder list open" }).clicked() {
+                        if state.pinned {
+                            state.close();
+                        } else {
+                            state.pinned = true;
+                            state.open = true;
+                        }
+                        ui.close_menu();
+                    }
+                    ui.separator();
                     for entry in actions::menu_entries(&target, options) {
                         match entry {
                             actions::MenuEntry::Separator => { ui.separator(); }
@@ -430,22 +459,31 @@ pub fn show(
         state.dropdown_rect = Rect::NOTHING;
         return;
     }
-    let Some(segment) = segs.get(index) else {
+    let is_child = index == segs.len();
+    if !is_child && segs.get(index).is_none() {
         state.dropdown_rect = Rect::NOTHING;
         return;
+    }
+
+    let (parent, current_path) = if is_child {
+        (dir.to_path_buf(), None)
+    } else {
+        let segment = &segs[index];
+        (
+            segment.1.parent().unwrap_or(Path::new("/")).to_path_buf(),
+            Some(segment.1.clone()),
+        )
     };
 
-    let parent = segment.1.parent().unwrap_or(Path::new("/")).to_path_buf();
-
-    // Read the sibling list once per opening instead of every frame.
-    let stale = state
-        .sibling_cache
-        .as_ref()
-        .map_or(true, |c| c.parent != parent || c.show_hidden != show_hidden);
+    // Read the folder list once per opening instead of every frame.
+    let stale = state.sibling_cache.as_ref().map_or(true, |c| {
+        c.parent != parent || c.show_hidden != show_hidden || c.children != is_child
+    });
     if stale {
         state.sibling_cache = Some(SiblingCache {
             parent: parent.clone(),
             show_hidden,
+            children: is_child,
             dirs: sibling_dirs(&parent, show_hidden),
         });
     }
@@ -463,7 +501,7 @@ pub fn show(
                     .map(|n| n.to_string_lossy().into_owned())
                     .unwrap_or_default();
                 let count = counts.get(path).copied().unwrap_or(0);
-                let current = *path == segment.1;
+                let current = current_path.as_ref() == Some(path);
                 Row { path: path.clone(), name, count, current }
             })
             .collect()

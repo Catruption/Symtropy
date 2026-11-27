@@ -1,15 +1,21 @@
 mod actions;
 mod app;
-mod drag_source;
+mod wayland_drag;
 mod filter;
 mod gallery;
 mod file_manager;
+mod local_vision;
+mod metadata_export;
 mod paths;
 mod pathbar;
+mod query_agent;
+mod query_composer;
 mod sidebar;
+mod source_search;
+mod tag_review;
+mod tag_manager;
 mod theme;
 mod window;
-mod x11;
 
 use app::SymtropyApp;
 use std::sync::OnceLock;
@@ -24,13 +30,6 @@ pub(crate) fn startup_ms() -> u128 {
 fn main() -> eframe::Result<()> {
     PROCESS_START.get_or_init(Instant::now);
     eprintln!("startup: process start @ {}ms", startup_ms());
-    // Force X11/XWayland so our _GTK_FRAME_EXTENTS tiling hack works. winit 0.29 picks native
-    // Wayland whenever WAYLAND_DISPLAY is set (it no longer reads WINIT_UNIX_BACKEND), so hide it.
-    // This must run before anything else touches the environment or spawns a thread.
-    if std::env::var_os("DISPLAY").is_some() {
-        std::env::remove_var("WAYLAND_DISPLAY");
-    }
-
     // Optional positional argument: the image library to open. Falls back to
     // SYMTROPY_LIBRARY, then an executable/cwd-relative lookup. An explicit
     // choice overrides the directory remembered in the saved UI state.
@@ -41,6 +40,16 @@ fn main() -> eframe::Result<()> {
     let library = explicit_library
         .clone()
         .unwrap_or_else(paths::default_library_dir);
+
+    // winit 0.29 has no public Wayland window-geometry API. The patched local
+    // winit reads this before creating each surface and reports the visible
+    // plate through xdg_surface.set_window_geometry, leaving the transparent
+    // overhang outside snapping/tiling calculations. It is cleared in the app
+    // creator below so only the main window gets that margin.
+    std::env::set_var(
+        "SYMTROPY_WAYLAND_SHADOW_MARGIN_PX",
+        crate::window::OVERHANG.to_string(),
+    );
 
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
@@ -55,6 +64,10 @@ fn main() -> eframe::Result<()> {
         "Symtropy",
         options,
         Box::new(move |cc| {
+            // eframe has already created the root window, so the chrome margin
+            // is in that window's state. Later viewports (the media viewer)
+            // must not inherit it: they have no steel overhang.
+            std::env::remove_var("SYMTROPY_WAYLAND_SHADOW_MARGIN_PX");
             let app = SymtropyApp::new(cc, library, explicit_library);
             eprintln!("startup: app created @ {}ms", startup_ms());
             Box::new(app)

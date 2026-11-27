@@ -17,7 +17,7 @@ pub mod ui;
 pub mod workers;
 
 pub use hierarchy::Hierarchy;
-pub use query::Query;
+pub use query::{ClaimScope, ClaimSource, ConfidenceRange, Query, TagEvidence};
 pub use sidecar::Sidecar;
 pub use workers::{Msg, ScanMsg};
 
@@ -25,6 +25,26 @@ pub const MAX_UPLOADS_PER_FRAME: usize = 24;
 pub const MAX_TEXTURES: usize = 400;
 pub const MARGIN: f32 = 0.0;
 pub const TARGET_ROW_HEIGHT: f32 = 200.0;
+
+/// Height is quantized for zoom stability. The mosaic layout is O(n), so width
+/// uses exact pixels and always fills the viewport.
+pub(crate) const LAYOUT_WIDTH_BUCKET: i32 = 1;
+pub(crate) const LAYOUT_HEIGHT_BUCKET: i32 = 4;
+
+pub(crate) fn layout_bucket(px: i32, bucket: i32) -> i32 {
+    let bucket = bucket.max(1);
+    ((px.max(1) / bucket) * bucket).max(1)
+}
+
+/// How gallery thumbnails are arranged. Rows are uniform and predictable;
+/// masonry keeps the variable-height aspect mosaic for dense libraries.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum GalleryLayout {
+    #[default]
+    Rows,
+    Masonry,
+}
+
 pub const SCAN_TIMEOUT_SECS: u64 = 1800;
 
 #[derive(Clone, Debug, Default, serde::Serialize, serde::Deserialize)]
@@ -97,7 +117,7 @@ pub(crate) struct Thumb {
 }
 
 pub(crate) struct LayoutCache {
-    pub key: (i32, i32, i32, usize, String),
+    pub key: (u8, i32, i32, i32, usize, u64),
     pub cells: Vec<layout::Cell>,
     pub total_h: i32,
 }
@@ -138,9 +158,20 @@ pub struct GalleryState {
     pub(crate) icon_cache: HashMap<String, Option<TextureHandle>>,
 
     pub(crate) layout_cache: Option<LayoutCache>,
+    pub(crate) filtered_cache: Vec<usize>,
+    pub(crate) filter_cache_key: Option<(String, String, usize, u64, ConfidenceRange, ClaimScope, u64)>,
+    pub(crate) filter_generation: u64,
+    /// Effective per-image tag confidences used by the active filter.
+    pub(crate) filter_evidence: HashMap<String, TagEvidence>,
+    pub(crate) filter_confidence: ConfidenceRange,
+    /// Which authorities the active filter may match. Curated is the default;
+    /// machine scope is only installed by an explicit Tag Manager search.
+    pub(crate) filter_scope: ClaimScope,
+    pub(crate) filter_revision: u64,
     pub(crate) anim_start: HashMap<String, f64>,
 
     pub grid_scale: f32,
+    pub layout: GalleryLayout,
     pub scroll_offset: f32,
     pub sort_key: SortKey,
     pub sort_direction: SortDirection,
@@ -152,11 +183,21 @@ pub struct GalleryState {
     pub viewer_target: Option<String>,
     pub tag_tree: TagNode,
     pub tag_search_query: String,
+    /// Inspection toggle: include preserved-only tags in the taxonomy tree.
+    pub show_preserved_tags: bool,
     pub(crate) tags_text: String,
     pub(crate) tags_path: PathBuf,
 
     pub hierarchy: Hierarchy,
     pub active_query: Query,
+    /// Recursive filename search from the toolbar. Kept separate from the tag
+    /// query so `Find files` works for non-image projects too.
+    pub filename_query: String,
+    /// Visible toolbar toggle: extend the tag filter to descendant folders.
+    /// Never saved; the default is current-folder-only.
+    pub recursive_tag_search: bool,
+    pub(crate) recursive_root: Option<PathBuf>,
+    pub(crate) recursive_extra_paths: HashSet<String>,
     pub query_error: Option<String>,
 
     pub(crate) filter_pass: FilterPass,
@@ -165,63 +206,220 @@ pub struct GalleryState {
 }
 
 impl GalleryState {
-    /// Paths currently visible under the active query, in display order. Used by the
-    /// slideshow so it follows the same filters as the gallery.
-    pub fn visible_paths(&self) -> Vec<String> {
-        self.items
-            .iter()
-            .filter(|item| !item.is_folder)
-            .filter(|item| self.active_query.matches(&item.tags, item.rating, &self.hierarchy))
-            .map(|item| item.path.clone())
-            .collect()
-    }
-
     /// Drop every active filter without touching selection or view settings.
     pub fn clear_filters(&mut self) {
         self.active_query = Query::AlwaysTrue;
+        self.filename_query.clear();
+        self.filter_confidence = ConfidenceRange::accepted_only();
+        self.filter_scope = ClaimScope::Curated;
         self.query_error = None;
+        self.filter_generation = self.filter_generation.wrapping_add(1);
+        self.filter_cache_key = None;
+        self.layout_cache = None;
+    }
+
+    /// Remove any descendant items added by a previous recursive search.
+    /// Called whenever the toggle is switched off or the tag query is cleared,
+    /// so an unfiltered gallery never shows files from other folders.
+    pub(crate) fn clear_recursive_items(&mut self) {
+        if self.recursive_extra_paths.is_empty() {
+            return;
+        }
+        self.items.retain(|item| !self.recursive_extra_paths.contains(&item.path));
+        self.recursive_extra_paths.clear();
+        self.recursive_root = None;
+        self.selected_images.retain(|path| self.items.iter().any(|item| &item.path == path));
+        self.invalidate_filter_cache();
+    }
+
+    /// Add descendant items from the global index. `root` records which folder
+    /// the extras belong to so navigating elsewhere cannot reuse stale rows.
+    pub(crate) fn add_recursive_items(&mut self, root: PathBuf, items: Vec<GalleryItem>) {
+        self.recursive_extra_paths = items.iter().map(|item| item.path.clone()).collect();
+        self.recursive_root = Some(root);
+        // Descendant rows are appended in index order. Running the full
+        // metadata sort here would stat tens of thousands of files and stall
+        // the frame; explicit sort changes still reorder everything later.
+        self.items.extend(items);
+        self.invalidate_filter_cache();
+    }
+
+    pub fn set_layout(&mut self, layout: GalleryLayout) {
+        if self.layout == layout {
+            return;
+        }
+        self.layout = layout;
+        self.layout_cache = None;
+    }
+
+    /// Update the filename portion of the visible set. Lowercasing once here
+    /// keeps the per-item check cheap even in a large gallery.
+    pub fn set_filename_query(&mut self, query: &str) {
+        if self.filename_query == query {
+            return;
+        }
+        self.filename_query = query.to_string();
+        self.invalidate_filter_cache();
+    }
+
+    pub(crate) fn invalidate_filter_cache(&mut self) {
+        self.filter_generation = self.filter_generation.wrapping_add(1);
+        self.filter_cache_key = None;
+        self.layout_cache = None;
+    }
+
+    pub(crate) fn filtered_indices(&mut self) -> &[usize] {
+        let filename = self.filename_query.to_lowercase();
+        let key = (
+            self.active_query.to_string(),
+            filename.clone(),
+            self.items.len(),
+            self.filter_generation,
+            self.filter_confidence,
+            self.filter_scope,
+            self.filter_revision,
+        );
+        if self.filter_cache_key.as_ref() != Some(&key) {
+            let indices = self
+                .items
+                .iter()
+                .enumerate()
+                .filter(|(_, item)| {
+                    if !filename.is_empty() {
+                        let haystack = format!("{} {}", item.title, item.path).to_lowercase();
+                        if !haystack.contains(&filename) {
+                            return false;
+                        }
+                    }
+                    if matches!(self.active_query, Query::AlwaysTrue) {
+                        return true;
+                    }
+                    let fallback = TagEvidence::from_tags(item.tags.iter().map(String::as_str));
+                    let evidence = self.filter_evidence.get(&item.path).unwrap_or(&fallback);
+                    self.active_query.matches_evidence(
+                        evidence,
+                        item.rating,
+                        &self.hierarchy,
+                        self.filter_confidence,
+                        self.filter_scope,
+                    )
+                })
+                .map(|(i, _)| i)
+                .collect();
+            self.filtered_cache = indices;
+            self.filter_cache_key = Some(key);
+        }
+        &self.filtered_cache
     }
 
     /// Fold sidecar-only tags and their parent links into the taxonomy. The
     /// tags.txt entries come first so their hierarchy wins on duplicates.
+    ///
+    /// Sidecar-only tags are inserted as real tree nodes instead of loose
+    /// indented lines. Flattening them made every tag a root, which broke both
+    /// the tree display and ancestor-aware filter matching.
     pub fn rebuild_tag_tree(&mut self) {
-        let known: HashSet<String> = self
-            .tags_text
-            .lines()
-            .map(str::trim)
-            .filter(|name| !name.is_empty())
-            .map(str::to_string)
-            .collect();
-        let mut extra: HashSet<String> = HashSet::new();
+        #[derive(Clone)]
+        struct PendingTag {
+            name: String,
+            parent: Option<String>,
+        }
 
-        for item in &self.items {
-            for (child, parent) in &item.sidecar.tag_parents {
-                if child.is_empty() || parent.is_empty() {
-                    continue;
-                }
-                if !known.contains(parent) {
-                    extra.insert(parent.clone());
-                }
-                if !known.contains(child) {
-                    extra.insert(format!("  {}", child));
-                }
+        fn note_tag(
+            known: &HashSet<String>,
+            pending: &mut HashMap<String, PendingTag>,
+            name: &str,
+            parent: Option<&str>,
+        ) {
+            let name = name.trim();
+            if name.is_empty() {
+                return;
             }
-            for tag in &item.sidecar.tags {
-                if !tag.is_empty() && !known.contains(tag) {
-                    extra.insert(tag.clone());
-                }
+            let key = hierarchy::tag_key(name);
+            if known.contains(&key) {
+                return;
+            }
+            let entry = pending
+                .entry(key)
+                .or_insert_with(|| PendingTag { name: name.to_string(), parent: None });
+            if entry.parent.is_none() {
+                entry.parent = parent.map(str::trim).filter(|p| !p.is_empty()).map(str::to_string);
             }
         }
 
-        let combined = if extra.is_empty() {
-            self.tags_text.clone()
-        } else {
-            let mut lines: Vec<String> = extra.into_iter().collect();
-            lines.sort();
-            format!("{}\n{}\n", self.tags_text, lines.join("\n"))
-        };
-        self.hierarchy = Hierarchy::parse(&combined);
+        let mut hierarchy = Hierarchy::parse(&self.tags_text);
+        let mut known: HashSet<String> = hierarchy.keys().into_iter().collect();
+        let mut names_by_key: HashMap<String, String> = known
+            .iter()
+            .filter_map(|key| hierarchy.name_for_key(key).map(|name| (key.clone(), name.to_string())))
+            .collect();
+        let mut pending: HashMap<String, PendingTag> = HashMap::new();
+
+        for item in &self.items {
+            let parent_links: Vec<(String, String)> = if self.show_preserved_tags {
+                item.sidecar
+                    .tag_parents
+                    .iter()
+                    .map(|(child, parent)| (child.clone(), parent.clone()))
+                    .collect()
+            } else {
+                item.sidecar.active_tag_parents().into_iter().collect()
+            };
+            for (child, parent) in parent_links {
+                // A tag already in tags.txt keeps its canonical parent. Only
+                // sidecar-only descendants need to be grafted onto the tree.
+                if !hierarchy.contains_key(&child) {
+                    note_tag(&known, &mut pending, &child, Some(&parent));
+                }
+                note_tag(&known, &mut pending, &parent, None);
+            }
+            let tags = if self.show_preserved_tags {
+                item.sidecar.tags.clone()
+            } else {
+                item.sidecar.active_tags()
+            };
+            for tag in tags {
+                note_tag(&known, &mut pending, &tag, None);
+            }
+        }
+
+        // Resolve parents before children, but queue the inserts instead of
+        // applying them one at a time. Each isolated insert rebuilds the full
+        // ancestor index, which stalled navigation in large folders.
+        let mut queued: Vec<(String, Option<String>)> = Vec::new();
+        loop {
+            let keys: Vec<String> = pending.keys().cloned().collect();
+            let mut progress = false;
+            for key in keys {
+                let Some(node) = pending.get(&key).cloned() else { continue };
+                let parent_name = node
+                    .parent
+                    .as_deref()
+                    .map(hierarchy::tag_key)
+                    .and_then(|parent_key| names_by_key.get(&parent_key).cloned());
+                if node.parent.is_some() && parent_name.is_none() {
+                    continue;
+                }
+                queued.push((node.name.clone(), parent_name));
+                names_by_key.insert(key.clone(), node.name.clone());
+                pending.remove(&key);
+                known.insert(key);
+                progress = true;
+            }
+            if !progress || pending.is_empty() {
+                break;
+            }
+        }
+        for node in pending.into_values() {
+            queued.push((node.name, None));
+        }
+        hierarchy.insert_batch(queued);
+
+        self.hierarchy = hierarchy;
         self.tag_tree = tree_from_hierarchy(&self.hierarchy);
+        self.filter_generation = self.filter_generation.wrapping_add(1);
+        self.filter_cache_key = None;
+        self.layout_cache = None;
     }
 
     /// Persist the current taxonomy and refresh the sidebar tree from it.
@@ -237,14 +435,30 @@ impl GalleryState {
         }
         self.tags_text = text;
         self.tag_tree = tree_from_hierarchy(&self.hierarchy);
+        self.filter_generation = self.filter_generation.wrapping_add(1);
+        self.filter_cache_key = None;
         Ok(())
     }
 
+    /// Find the taxonomy closest to a gallery folder. Nested folders such as
+    /// `database/References/X` must still use `database/tags.txt`; looking only
+    /// at the immediate parent silently started from an empty taxonomy.
+    fn find_tags_path(dir: &Path) -> PathBuf {
+        let mut current = Some(dir);
+        while let Some(path) = current {
+            let candidate = path.join("tags.txt");
+            if candidate.is_file() {
+                return candidate;
+            }
+            current = path.parent();
+        }
+        dir.parent()
+            .map(|parent| parent.join("tags.txt"))
+            .unwrap_or_else(|| PathBuf::from("tags.txt"))
+    }
+
     pub fn scan_dir(ctx: &egui::Context, dir: &Path) -> Self {
-        let tags_path = dir
-        .parent()
-        .map(|p| p.join("tags.txt"))
-        .unwrap_or_else(|| std::path::PathBuf::from("tags.txt"));
+        let tags_path = Self::find_tags_path(dir);
         let tags_text = std::fs::read_to_string(&tags_path).unwrap_or_default();
         if tags_text.is_empty() {
             eprintln!("gallery: no tag file at {} — starting from sidecar tags", tags_path.display());
@@ -296,8 +510,16 @@ impl GalleryState {
             inflight: HashMap::new(),
             icon_cache: HashMap::new(),
             layout_cache: None,
+            filtered_cache: Vec::new(),
+            filter_cache_key: None,
+            filter_generation: 0,
+            filter_evidence: HashMap::new(),
+            filter_confidence: ConfidenceRange::accepted_only(),
+            filter_scope: ClaimScope::Curated,
+            filter_revision: 0,
             anim_start: HashMap::new(),
             grid_scale: 1.0,
+            layout: GalleryLayout::default(),
             scroll_offset: 0.0,
             sort_key: SortKey::default(),
             sort_direction: SortKey::default().default_direction(),
@@ -308,10 +530,15 @@ impl GalleryState {
             viewer_target: None,
             tag_tree,
             tag_search_query: String::new(),
+            show_preserved_tags: false,
             tags_text,
             tags_path,
             hierarchy,
             active_query: Query::AlwaysTrue,
+            filename_query: String::new(),
+            recursive_tag_search: false,
+            recursive_root: None,
+            recursive_extra_paths: HashSet::new(),
             query_error: None,
             filter_pass: FilterPass::default(),
             wanted_now: HashMap::new(),
@@ -375,6 +602,8 @@ impl GalleryState {
             )
         });
         self.layout_cache = None;
+        self.filter_cache_key = None;
+        self.filter_generation = self.filter_generation.wrapping_add(1);
     }
 
     pub(crate) fn poll(&mut self, ctx: &egui::Context) {
@@ -394,6 +623,9 @@ impl GalleryState {
             match self.scan_rx.try_recv() {
                 Ok(ScanMsg::Batch(items)) => {
                     self.items.extend(items);
+                    self.filter_generation = self.filter_generation.wrapping_add(1);
+                    self.filter_cache_key = None;
+                    self.layout_cache = None;
                 }
                 Ok(ScanMsg::MarginUpdate { path, margins, colors }) => {
                     if let Some(it) = self.items.iter_mut().find(|i| i.path == path) {
@@ -405,6 +637,8 @@ impl GalleryState {
                     self.scanning = false;
                     self.rebuild_tag_tree();
                     self.sort_items();
+                    self.filter_generation = self.filter_generation.wrapping_add(1);
+                    self.filter_cache_key = None;
                     ctx.request_repaint();
                     eprintln!(
                         "startup: item list ready @ {}ms ({} items)",
@@ -486,5 +720,219 @@ impl GalleryState {
             drop(q);
             self.shared.cv.notify_all();
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn layout_bucket_rounds_down_and_keeps_tiny_widths() {
+        assert_eq!(layout_bucket(321, 16), 320);
+        assert_eq!(layout_bucket(319, 16), 304);
+        assert_eq!(layout_bucket(1, 16), 1);
+        assert_eq!(layout_bucket(321, 1), 321);
+    }
+
+    #[test]
+    fn tags_path_is_found_in_an_ancestor_directory() {
+        let base = std::env::temp_dir().join(format!(
+            "symtropy-tags-path-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()
+        ));
+        let nested = base.join("References").join("X");
+        std::fs::create_dir_all(&nested).unwrap();
+        let tags = base.join("tags.txt");
+        std::fs::write(&tags, "animal\n  feline\n").unwrap();
+
+        assert_eq!(GalleryState::find_tags_path(&nested), tags);
+        std::fs::remove_dir_all(base).ok();
+    }
+
+    #[test]
+    fn sidecar_tags_keep_their_parent_links() {
+        let mut sc = Sidecar::default();
+        sc.tags = vec!["thunderclan".into(), "firestar".into()];
+        sc.tag_parents.insert("firestar".into(), "thunderclan".into());
+
+        let (scan_tx, scan_rx) = channel::<ScanMsg>();
+        drop(scan_tx);
+        let (result_tx, result_rx) = channel::<Msg>();
+        drop(result_tx);
+        let shared = Arc::new(workers::Shared {
+            queue: std::sync::Mutex::new(Vec::new()),
+            cv: std::sync::Condvar::new(),
+            wanted: std::sync::Mutex::new(HashMap::new()),
+        });
+        let item = GalleryItem {
+            id: "a.png".into(),
+            title: "a".into(),
+            path: "/library/a.png".into(),
+            is_folder: false,
+            ext: "png".into(),
+            aspect_ratio: 1.0,
+            width: 1.0,
+            height: 1.0,
+            border_colors: BorderColors::default(),
+            margins: Margins::default(),
+            rating: 0,
+            tags: sc.active_tags().into_iter().collect(),
+            sidecar: sc,
+        };
+        let mut gallery = GalleryState {
+            items: vec![item],
+            scanning: false,
+            scan_rx,
+            scan_progress: Arc::new(AtomicUsize::new(0)),
+            scan_started_at: None,
+            shared,
+            result_rx,
+            thumbs: HashMap::new(),
+            failed: HashSet::new(),
+            inflight: HashMap::new(),
+            icon_cache: HashMap::new(),
+            layout_cache: None,
+            filtered_cache: Vec::new(),
+            filter_cache_key: None,
+            filter_generation: 0,
+            filter_evidence: HashMap::new(),
+            filter_confidence: ConfidenceRange::accepted_only(),
+            filter_scope: ClaimScope::Curated,
+            filter_revision: 0,
+            anim_start: HashMap::new(),
+            grid_scale: 1.0,
+            layout: GalleryLayout::default(),
+            scroll_offset: 0.0,
+            sort_key: SortKey::default(),
+            sort_direction: SortKey::default().default_direction(),
+            selected_images: Vec::new(),
+            selection_anchor: None,
+            keyboard_focus: None,
+            request_open_viewer: false,
+            viewer_target: None,
+            tag_tree: TagNode { name: "Root".into(), children: Vec::new() },
+            tag_search_query: String::new(),
+            show_preserved_tags: false,
+            tags_text: "allegiance (clans)\n  thunderclan\n".into(),
+            tags_path: PathBuf::from("/library/tags.txt"),
+            hierarchy: Hierarchy::parse("allegiance (clans)\n  thunderclan\n"),
+            active_query: Query::AlwaysTrue,
+            filename_query: String::new(),
+            recursive_tag_search: false,
+            recursive_root: None,
+            recursive_extra_paths: HashSet::new(),
+            query_error: None,
+            filter_pass: crate::filter::FilterPass::default(),
+            wanted_now: HashMap::new(),
+            new_jobs: Vec::new(),
+        };
+
+        gallery.rebuild_tag_tree();
+
+        assert!(gallery.hierarchy.contains_key("firestar"));
+        assert!(gallery.hierarchy.is_descendant_of("firestar", "thunderclan"));
+        assert!(!gallery.hierarchy.roots().iter().any(|root| root == "firestar"));
+        let allegiance = gallery
+            .tag_tree
+            .children
+            .iter()
+            .find(|node| node.name == "allegiance (clans)")
+            .unwrap();
+        let thunderclan = allegiance.children.iter().find(|node| node.name == "thunderclan").unwrap();
+        assert!(thunderclan.children.iter().any(|node| node.name == "firestar"));
+
+        gallery.set_filename_query("missing-name");
+        assert!(gallery.filtered_indices().is_empty());
+        gallery.set_filename_query("a.png");
+        assert_eq!(gallery.filtered_indices().len(), 1);
+        gallery.clear_filters();
+        assert!(gallery.filename_query.is_empty());
+        assert_eq!(gallery.filtered_indices().len(), 1);
+    }
+
+    #[test]
+    fn recursive_items_are_removed_when_scope_is_cleared() {
+        let (scan_tx, scan_rx) = channel::<ScanMsg>();
+        drop(scan_tx);
+        let (result_tx, result_rx) = channel::<Msg>();
+        drop(result_tx);
+        let shared = Arc::new(workers::Shared {
+            queue: std::sync::Mutex::new(Vec::new()),
+            cv: std::sync::Condvar::new(),
+            wanted: std::sync::Mutex::new(HashMap::new()),
+        });
+        let here = GalleryItem {
+            id: "/root/here.webp".into(), title: "here.webp".into(),
+            path: "/root/here.webp".into(), is_folder: false, ext: "webp".into(),
+            aspect_ratio: 1.0, width: 10.0, height: 10.0,
+            border_colors: BorderColors::default(), margins: Margins::default(),
+            rating: 0, tags: HashSet::new(), sidecar: Sidecar::default(),
+        };
+        let deep = GalleryItem {
+            id: "/root/deep/deep.webp".into(), title: "deep.webp".into(),
+            path: "/root/deep/deep.webp".into(), is_folder: false, ext: "webp".into(),
+            aspect_ratio: 1.0, width: 10.0, height: 10.0,
+            border_colors: BorderColors::default(), margins: Margins::default(),
+            rating: 0, tags: HashSet::from(["fox".into()]), sidecar: Sidecar::default(),
+        };
+        let mut gallery = GalleryState {
+            items: vec![here],
+            scanning: false,
+            scan_rx,
+            scan_progress: Arc::new(AtomicUsize::new(0)),
+            scan_started_at: None,
+            shared,
+            result_rx,
+            thumbs: HashMap::new(),
+            failed: HashSet::new(),
+            inflight: HashMap::new(),
+            icon_cache: HashMap::new(),
+            layout_cache: None,
+            filtered_cache: Vec::new(),
+            filter_cache_key: None,
+            filter_generation: 0,
+            filter_evidence: HashMap::new(),
+            filter_confidence: ConfidenceRange::accepted_only(),
+            filter_scope: ClaimScope::Curated,
+            filter_revision: 0,
+            anim_start: HashMap::new(),
+            grid_scale: 1.0,
+            layout: GalleryLayout::default(),
+            scroll_offset: 0.0,
+            sort_key: SortKey::default(),
+            sort_direction: SortKey::default().default_direction(),
+            selected_images: vec!["/root/deep/deep.webp".into()],
+            selection_anchor: None,
+            keyboard_focus: None,
+            request_open_viewer: false,
+            viewer_target: None,
+            tag_tree: TagNode { name: "Root".into(), children: Vec::new() },
+            tag_search_query: String::new(),
+            show_preserved_tags: false,
+            tags_text: String::new(),
+            tags_path: PathBuf::from("/root/tags.txt"),
+            hierarchy: Hierarchy::default(),
+            active_query: Query::Tag("fox".into()),
+            filename_query: String::new(),
+            recursive_tag_search: true,
+            recursive_root: None,
+            recursive_extra_paths: HashSet::new(),
+            query_error: None,
+            filter_pass: FilterPass::default(),
+            wanted_now: HashMap::new(),
+            new_jobs: Vec::new(),
+        };
+
+        gallery.add_recursive_items(PathBuf::from("/root"), vec![deep]);
+        assert_eq!(gallery.items.len(), 2);
+        assert_eq!(gallery.filtered_indices().len(), 1);
+        assert_eq!(gallery.recursive_root.as_deref(), Some(Path::new("/root")));
+
+        gallery.clear_recursive_items();
+        assert_eq!(gallery.items.len(), 1);
+        assert!(gallery.filtered_indices().is_empty());
+        assert!(gallery.selected_images.is_empty());
     }
 }

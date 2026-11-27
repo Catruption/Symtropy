@@ -1,14 +1,58 @@
 use egui::{Color32, Id, Key, Response, RichText, ScrollArea, TextEdit, Ui};
 use crate::actions::{self, Action, TagDialog, TagMenuTarget};
-use crate::gallery::{TagNode, Sidecar};
+use crate::gallery::{ClaimScope, ConfidenceRange, Query, TagNode, Sidecar};
 use std::path::Path;
 
-/// The FILTER side of the sidebar. This is just the tag expression plus a
-/// minimum rating; the same tag tree is used by EDIT mode to write sidecars.
-#[derive(Default, Clone)]
+/// The FILTER side of the sidebar. Only curated tag-tree/DSL queries are
+/// authored here. AI prompt searches live in Tag Manager and arrive here as an
+/// already-compiled query carrying a machine claim scope.
+#[derive(Clone)]
 pub struct FilterQuery {
     pub filter: String,
+    pub claim_scope: ClaimScope,
     pub rating_min: Option<u8>,
+    pub confidence_min: u8,
+    pub confidence_max: u8,
+}
+
+impl Default for FilterQuery {
+    fn default() -> Self {
+        Self {
+            filter: String::new(),
+            claim_scope: ClaimScope::Curated,
+            rating_min: None,
+            confidence_min: 100,
+            confidence_max: 100,
+        }
+    }
+}
+
+impl FilterQuery {
+    pub fn confidence_range(&self) -> ConfidenceRange {
+        ConfidenceRange::new(self.confidence_min, self.confidence_max)
+    }
+
+    /// Compile the exact tag DSL. The rating control is an additional AND term.
+    pub fn compile(&self, _tag_tree: &TagNode) -> Result<Query, String> {
+        let base = Query::parse(&self.filter)?;
+        Ok(match self.rating_min {
+            Some(min) => match base {
+                Query::AlwaysTrue => Query::Rating { min, exact: false },
+                other => Query::And(vec![other, Query::Rating { min, exact: false }]),
+            },
+            None => base,
+        })
+    }
+
+    pub fn compile_for_apply(&self, tag_tree: &TagNode) -> Result<Query, String> {
+        self.compile(tag_tree)
+    }
+
+    fn normalize_confidence(&mut self) {
+        let range = self.confidence_range();
+        self.confidence_min = range.min;
+        self.confidence_max = range.max;
+    }
 }
 
 /// Draw a 5-star widget. Returns Some(new_value) if the user clicked a star.
@@ -49,6 +93,53 @@ pub(crate) fn tag_catalog(root: &TagNode) -> Vec<String> {
     tags.sort();
     tags.dedup();
     tags
+}
+
+fn find_tag_node<'a>(root: &'a TagNode, key: &str) -> Option<&'a TagNode> {
+    if root.name != "Root" && query_token(&root.name) == key {
+        return Some(root);
+    }
+    root.children.iter().find_map(|child| find_tag_node(child, key))
+}
+
+fn query_tag_ids(query: &Query, out: &mut Vec<String>) {
+    match query {
+        Query::Tag(tag) => out.push(tag.clone()),
+        Query::Not(inner) => query_tag_ids(inner, out),
+        Query::And(parts) | Query::Or(parts) | Query::Except(parts) => {
+            for part in parts {
+                query_tag_ids(part, out);
+            }
+        }
+        Query::Relation(relation) => {
+            if let crate::gallery::query::QueryEntity::Tag(tag) = &relation.object {
+                out.push(tag.clone());
+            }
+        }
+        Query::Rating { .. } | Query::AlwaysTrue => {}
+    }
+}
+
+/// Parent tags intentionally match their children. Say so before the user
+/// wonders why a file tagged only `whitestorm` appears under `thunderclan`.
+fn show_tag_descendant_hint(ui: &mut Ui, tag_tree: &TagNode, tags: &[String]) {
+    let mut shown = std::collections::HashSet::new();
+    for tag in tags {
+        let key = query_token(tag);
+        if !shown.insert(key.clone()) {
+            continue;
+        }
+        if let Some(node) = find_tag_node(tag_tree, &key) {
+            if !node.children.is_empty() {
+                let children = node.children.iter().map(|child| child.name.clone()).collect::<Vec<_>>().join(", ");
+                ui.label(
+                    RichText::new(format!("\"{}\" also matches child tags: {}", node.name, children))
+                        .size(10.0)
+                        .color(Color32::GRAY),
+                );
+            }
+        }
+    }
 }
 
 fn active_query_token(input: &str) -> (usize, String) {
@@ -180,8 +271,10 @@ pub fn draw_sidebar(
     filter_query: &mut FilterQuery,
     tag_tree: &TagNode,
     search_query: &mut String,
+    show_preserved: &mut bool,
     metadata_path: Option<&Path>,
     query_error: Option<&str>,
+    scope_label: &str,
     actions: &mut Vec<Action>,
 ) -> (bool, bool) {
     let mut apply = false;
@@ -193,8 +286,18 @@ pub fn draw_sidebar(
     ui.spacing_mut().item_spacing = egui::vec2(8.0, 8.0);
 
     ui.horizontal(|ui| {
-        ui.selectable_value(is_edit_mode, false, " FILTER ");
-        ui.selectable_value(is_edit_mode, true, " EDIT ");
+        if ui.selectable_label(!*is_edit_mode, " FILTER ").clicked() {
+            *is_edit_mode = false;
+        }
+        if ui.selectable_label(*is_edit_mode, " EDIT ").clicked() {
+            *is_edit_mode = true;
+        }
+        ui.separator();
+        if ui.small_button("TAG MANAGER ↗").on_hover_text(
+            "Open the native Tag Manager window",
+        ).clicked() {
+            actions.push(Action::OpenTagManager(None));
+        }
     });
     ui.separator();
 
@@ -203,7 +306,9 @@ pub fn draw_sidebar(
         ui.horizontal(|ui| {
             if ui.button("Revert").clicked() { revert = true; }
             ui.add_space(8.0);
-            if ui.button(if *is_edit_mode { "Apply Edits" } else { "Apply Filter" }).clicked() { apply = true; }
+            if ui.button(if *is_edit_mode { "Apply Edits" } else { "Apply Filter" }).clicked() {
+                apply = true;
+            }
         });
         ui.separator();
 
@@ -219,8 +324,33 @@ pub fn draw_sidebar(
                         let scroll_height =
                             (ui.available_height() - search_height - add_height - 14.0).max(40.0);
 
-                        if ui.small_button("＋ New top-level tag").clicked() {
-                            actions.push(Action::TagDialog(TagDialog::New { parent: None }));
+                        ui.label(
+                            RichText::new(if *is_edit_mode {
+                                "All known tags · checked = in this file's sidecar"
+                            } else {
+                                "All known tags · selected = filter criteria"
+                            })
+                            .size(10.0)
+                            .color(Color32::GRAY),
+                        );
+                        ui.horizontal(|ui| {
+                            if ui.small_button("＋ New top-level tag").clicked() {
+                                actions.push(Action::TagDialog(TagDialog::New { parent: None }));
+                            }
+                            if ui
+                                .small_button("show preserved")
+                                .on_hover_text("Include tags kept in the sidecar but hidden from the active index")
+                                .clicked()
+                            {
+                                *show_preserved = !*show_preserved;
+                            }
+                        });
+                        if *show_preserved {
+                            ui.label(
+                                RichText::new("Preserved tags are shown for inspection only.")
+                                    .size(10.0)
+                                    .color(Color32::GRAY),
+                            );
                         }
 
                         ui.scope(|ui| {
@@ -228,7 +358,7 @@ pub fn draw_sidebar(
                             let selected_tags = if *is_edit_mode {
                                 std::collections::HashSet::new()
                             } else {
-                                filter_tokens(&filter_query.filter)
+                                selected_filter_tokens(filter_query)
                             };
                             let search = search_query.trim().to_lowercase();
                             ScrollArea::vertical().auto_shrink([false, false]).max_height(scroll_height).show(ui, |ui| {
@@ -260,7 +390,7 @@ pub fn draw_sidebar(
                                     ui.label("No sidecar loaded.");
                                 }
                             } else {
-                                draw_filter_properties(ui, filter_query, query_error, tag_tree);
+                                draw_filter_properties(ui, filter_query, query_error, tag_tree, scope_label, &mut revert);
                             }
                         });
                     },
@@ -274,6 +404,13 @@ pub fn draw_sidebar(
 /// One canonical key shared by the tree, suggestions, and the query matcher.
 fn query_token(tag: &str) -> String {
     crate::gallery::hierarchy::tag_key(tag)
+}
+
+/// Rewrite an exact DSL token when a tag is renamed or removed.
+pub fn replace_filter_text(filter: &str, from: &str, to: Option<&str>) -> String {
+    let from_key = crate::gallery::hierarchy::tag_key(from);
+    let to_key = to.map(crate::gallery::hierarchy::tag_key);
+    replace_filter_token(filter, &from_key, to_key.as_deref())
 }
 
 /// Rewrite a whole token in a filter expression. `from` is a normalized tag key;
@@ -313,6 +450,12 @@ fn filter_tokens(filter: &str) -> std::collections::HashSet<String> {
         .collect()
 }
 
+/// Tags currently referenced by the exact filter, normalized for tree
+/// highlighting.
+fn selected_filter_tokens(filter: &FilterQuery) -> std::collections::HashSet<String> {
+    filter_tokens(&filter.filter)
+}
+
 fn append_filter_token(filter: &mut String, token: &str) -> bool {
     if filter_tokens(filter).contains(token) {
         return false;
@@ -327,6 +470,22 @@ fn append_filter_token(filter: &mut String, token: &str) -> bool {
         format!("({}) + {}", base, token)
     };
     true
+}
+
+/// Tree clicks add an exact token; machine queries are never edited here.
+fn append_filter_query(
+    filter: &mut FilterQuery,
+    token: &str,
+    selected: &std::collections::HashSet<String>,
+) -> bool {
+    if filter.claim_scope != ClaimScope::Curated {
+        return false;
+    }
+    let key = crate::gallery::hierarchy::tag_key(token);
+    if selected.contains(&key) {
+        return false;
+    }
+    append_filter_token(&mut filter.filter, token)
 }
 
 fn node_matches_search(node: &TagNode, needle: &str) -> bool {
@@ -368,7 +527,7 @@ fn draw_tag_node(
             .default_open(!search.is_empty())
             .show(ui, |ui| {
                 if !is_edit_mode && ui.small_button(format!("Filter by {}", node.name)).clicked()
-                    && append_filter_token(&mut filter_query.filter, &query_token(&node.name))
+                    && append_filter_query(filter_query, &query_token(&node.name), selected)
                 {
                     *apply = true;
                 }
@@ -412,7 +571,7 @@ fn draw_tag_node(
             RichText::new(&node.name).size(13.0),
         );
         actions::show_tag_menu(&response, menu_target, actions);
-        if response.clicked() && append_filter_token(&mut filter_query.filter, &query_token(&node.name)) {
+        if response.clicked() && append_filter_query(filter_query, &query_token(&node.name), selected) {
             *apply = true;
         }
     }
@@ -453,6 +612,14 @@ fn draw_edit_properties(ui: &mut Ui, sc: &mut Sidecar, path: Option<&Path>, tag_
     ui.label("Rating");
     if let Some(new_rating) = draw_stars(ui, sc.rating) {
         sc.rating = new_rating;
+    }
+    let mut suppressed = sc.is_display_suppressed();
+    if ui.checkbox(&mut suppressed, "Hide from gallery").changed() {
+        if suppressed {
+            sc.properties.insert("display".to_string(), "false".to_string());
+        } else {
+            sc.properties.remove("display");
+        }
     }
     ui.add_space(8.0);
 
@@ -560,29 +727,87 @@ fn draw_filter_properties(
     filter: &mut FilterQuery,
     query_error: Option<&str>,
     tag_tree: &TagNode,
+    scope_label: &str,
+    revert: &mut bool,
 ) {
     ui.add_space(8.0);
-
-    ui.label(RichText::new("Tags").strong());
-    let catalog = tag_catalog(tag_tree);
-    let filter_response = ui.add_sized(
-        [ui.available_width(), 60.0],
-        TextEdit::multiline(&mut filter.filter).hint_text("cat + fox - plush"),
-    );
-    show_tag_suggestions(
-        ui,
-        ui.make_persistent_id("filter_tag_suggestions"),
-        &filter_response,
-        &mut filter.filter,
-        &catalog,
-        true,
-        &[],
-    );
     ui.label(
-        RichText::new("+ all   | any   - not   ! not")
+        RichText::new(format!("Tag filter scope: {}", scope_label))
             .size(10.0)
             .color(Color32::GRAY),
     );
+    ui.label(
+        RichText::new("The top Search box filters filenames; this field filters tags in the current folder.")
+            .size(10.0)
+            .color(Color32::GRAY),
+    );
+
+    ui.horizontal(|ui| {
+        ui.label(RichText::new("Search").strong());
+        ui.separator();
+        let color = if filter.claim_scope == ClaimScope::Curated {
+            Color32::from_rgb(150, 220, 170)
+        } else {
+            Color32::from_rgb(255, 190, 110)
+        };
+        ui.label(
+            RichText::new(format!("source: {}", filter.claim_scope))
+                .size(10.0)
+                .color(color),
+        );
+        if filter.claim_scope != ClaimScope::Curated && ui.small_button("Clear AI filter").clicked() {
+            *revert = true;
+        }
+    });
+
+    if filter.claim_scope != ClaimScope::Curated {
+        ui.label(
+            RichText::new("Applied from Tag Manager. Rerun the AI search there, or clear it to edit curated tags.")
+                .size(10.0)
+                .color(Color32::GRAY),
+        );
+        ui.label(
+            RichText::new(format!("Exact: {}", filter.filter))
+                .size(10.0)
+                .color(Color32::GRAY),
+        );
+        if let Ok(query) = Query::parse(&filter.filter) {
+            let mut tags = Vec::new();
+            query_tag_ids(&query, &mut tags);
+            show_tag_descendant_hint(ui, tag_tree, &tags);
+        }
+    } else {
+        let catalog = tag_catalog(tag_tree);
+        let filter_response = ui.add_sized(
+            [ui.available_width(), 60.0],
+            TextEdit::multiline(&mut filter.filter)
+                .hint_text("cat + fox - plush\nrel:item:this@created_by@tag:artist:kitty"),
+        );
+        show_tag_suggestions(
+            ui,
+            ui.make_persistent_id("filter_tag_suggestions"),
+            &filter_response,
+            &mut filter.filter,
+            &catalog,
+            true,
+            &[],
+        );
+        ui.label(
+            RichText::new("+ all   | any   - not   ! not")
+                .size(10.0)
+                .color(Color32::GRAY),
+        );
+        ui.label(
+            RichText::new("rel:item:this@predicate@tag:id   (global rules match tagged images)")
+                .size(10.0)
+                .color(Color32::GRAY),
+        );
+        if let Ok(query) = Query::parse(&filter.filter) {
+            let mut tags = Vec::new();
+            query_tag_ids(&query, &mut tags);
+            show_tag_descendant_hint(ui, tag_tree, &tags);
+        }
+    }
 
     if let Some(error) = query_error {
         ui.label(
@@ -591,6 +816,45 @@ fn draw_filter_properties(
                 .size(11.0),
         );
     }
+    ui.add_space(8.0);
+
+    ui.label(RichText::new("Tag confidence").strong());
+    ui.horizontal(|ui| {
+        ui.label("Range");
+        ui.add(egui::DragValue::new(&mut filter.confidence_min).speed(1.0).clamp_range(0..=100));
+        ui.label("–");
+        ui.add(egui::DragValue::new(&mut filter.confidence_max).speed(1.0).clamp_range(0..=100));
+        ui.label("%");
+    });
+    filter.normalize_confidence();
+    ui.label(
+        RichText::new("100% = accepted/manual · 0–99% = suggestions")
+            .size(10.0)
+            .color(Color32::GRAY),
+    );
+    ui.horizontal_wrapped(|ui| {
+        if ui.small_button("Accepted").clicked() {
+            filter.confidence_min = 100;
+            filter.confidence_max = 100;
+        }
+        if ui.small_button("High 90–99").clicked() {
+            filter.confidence_min = 90;
+            filter.confidence_max = 99;
+        }
+        if ui.small_button("Borderline 50–89").clicked() {
+            filter.confidence_min = 50;
+            filter.confidence_max = 89;
+        }
+        if ui.small_button("Low 0–49").clicked() {
+            filter.confidence_min = 0;
+            filter.confidence_max = 49;
+        }
+        if ui.small_button("All").clicked() {
+            let range = ConfidenceRange::all();
+            filter.confidence_min = range.min;
+            filter.confidence_max = range.max;
+        }
+    });
     ui.add_space(8.0);
 
     ui.label("Minimum Rating");
@@ -608,9 +872,23 @@ fn draw_filter_properties(
 mod tests {
     use super::{
         active_editor_segment, active_query_token, append_filter_token, filter_tokens,
-        node_matches_search, query_token, replace_filter_token, tag_suggestions,
+        node_matches_search, query_token, replace_filter_text, replace_filter_token,
+        tag_suggestions, FilterQuery,
     };
-    use crate::gallery::TagNode;
+    use crate::gallery::{ClaimScope, ConfidenceRange, Query, TagNode};
+
+    #[test]
+    fn filter_defaults_to_accepted_only_and_normalizes_ranges() {
+        let mut filter = FilterQuery::default();
+        assert_eq!(filter.confidence_range(), ConfidenceRange::accepted_only());
+
+        filter.confidence_min = 90;
+        filter.confidence_max = 40;
+        filter.normalize_confidence();
+        assert_eq!(filter.confidence_min, 40);
+        assert_eq!(filter.confidence_max, 90);
+        assert_eq!(filter.confidence_range(), ConfidenceRange::new(40, 90));
+    }
 
     #[test]
     fn tag_names_with_spaces_become_query_tokens() {
@@ -665,5 +943,41 @@ mod tests {
         };
         assert!(node_matches_search(&tree, "derpy"));
         assert!(!node_matches_search(&tree, "dragon"));
+    }
+
+    #[test]
+    fn exact_filter_compiles_to_the_shared_query_ast() {
+        let tree = TagNode {
+            name: "Root".into(),
+            children: vec![TagNode { name: "feline".into(), children: vec![] }],
+        };
+        let mut filter = FilterQuery::default();
+        filter.filter = "feature:color:dominant_orange + feline".into();
+        filter.rating_min = Some(3);
+
+        assert_eq!(
+            filter.compile(&tree).unwrap(),
+            Query::And(vec![
+                Query::And(vec![
+                    Query::Tag("feature:color:dominant_orange".into()),
+                    Query::Tag("feline".into()),
+                ]),
+                Query::Rating { min: 3, exact: false },
+            ])
+        );
+    }
+
+    #[test]
+    fn sidebar_filters_default_to_curated_claims() {
+        let filter = FilterQuery::default();
+        assert_eq!(filter.claim_scope, ClaimScope::Curated);
+    }
+
+    #[test]
+    fn exact_tag_renames_rewrite_only_the_token() {
+        let renamed = replace_filter_text("rainbow_dash + fox", "rainbow dash", Some("rainbow pony"));
+        assert_eq!(renamed, "rainbow_pony + fox");
+        let removed = replace_filter_text("fox + rainbow_dash", "rainbow dash", None);
+        assert_eq!(removed.trim(), "fox +");
     }
 }

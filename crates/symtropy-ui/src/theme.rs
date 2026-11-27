@@ -1,6 +1,8 @@
 use egui::{vec2, Vec2};
 use serde::Deserialize;
 
+include!(concat!(env!("OUT_DIR"), "/generated_icons.rs"));
+
 pub const MIN_FRAME_SCALE: f32 = 0.25;
 pub const MAX_FRAME_SCALE: f32 = 6.0;
 pub const MIN_BUTTON_SCALE: f32 = 0.5;
@@ -171,14 +173,28 @@ impl Theme {
         }
     }
 
-    /// Embedded fallback icon for file types without a thumbnail.
-    pub fn icon_bytes(name: &str) -> Option<&'static [u8]> {
-        match name {
-            "folder" => Some(include_bytes!("../assets/themes/test/icons/folder.webp")),
-            "tar" => Some(include_bytes!("../assets/themes/test/icons/tar.png")),
-            "txt" => Some(include_bytes!("../assets/themes/test/icons/txt.webp")),
-            _ => None,
-        }
+    /// Find an embedded icon by extension name.
+    ///
+    /// A theme override in `assets/themes/<theme>/icons/<name>.<format>` wins;
+    /// otherwise the generic `assets/icons/<name>.<format>` is used. Supported
+    /// formats are discovered at build time, so adding an icon needs no Rust
+    /// change. Names are compared case-insensitively because file extensions
+    /// are normalized to lowercase by the scanner.
+    pub fn icon_bytes(&self, name: &str) -> Option<&'static [u8]> {
+        let theme = self.config.name.as_str();
+        ICON_ASSETS
+            .iter()
+            .find(|(owner, icon, _)| {
+                !owner.is_empty()
+                    && owner.eq_ignore_ascii_case(theme)
+                    && icon.eq_ignore_ascii_case(name)
+            })
+            .or_else(|| {
+                ICON_ASSETS.iter().find(|(owner, icon, _)| {
+                    owner.is_empty() && icon.eq_ignore_ascii_case(name)
+                })
+            })
+            .map(|(_, _, bytes)| *bytes)
     }
 
     /// Scale for title/inset geometry, in points per texture pixel.

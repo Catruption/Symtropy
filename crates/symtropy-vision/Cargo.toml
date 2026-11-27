@@ -1,0 +1,15 @@
+[package]
+name = "symtropy-vision"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+image = { workspace = true }
+ssvg = { path = "../ssvg" }
+ort = { version = "2.0.0-rc.15", default-features = false, features = ["std", "load-dynamic", "api-22"], optional = true }
+
+[features]
+default = []
+# Explicit-path ONNX/CLIP/SigLIP inference. Neither models nor runtime binaries
+# are downloaded; the caller supplies every local file path.
+onnx = ["dep:ort"]

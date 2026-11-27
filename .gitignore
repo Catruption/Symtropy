@@ -5,3 +5,4 @@ database/References_backup
 *.tmp
 *.tmp.png
 .DS_Store
+/ssvg/

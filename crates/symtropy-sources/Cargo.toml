@@ -1,0 +1,15 @@
+[package]
+name = "symtropy-sources"
+version = "0.1.0"
+edition = "2021"
+description = "Headless, user-initiated remote source adapters and local ingest for Symtropy"
+
+[dependencies]
+image = { workspace = true }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+symtropy-tags = { path = "../symtropy-tags" }
+ureq = "3.5"
+
+[lib]
+path = "src/lib.rs"

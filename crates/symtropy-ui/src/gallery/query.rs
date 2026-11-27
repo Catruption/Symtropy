@@ -11,6 +11,13 @@
 //!     ( )      grouping
 //!     rating:N exactly N stars
 //!     rating:N+ N stars or more
+//!     rel:S@predicate@O typed relation (first-class edge, not a tag)
+//!
+//! Relation endpoints are `item:this`, `item:path`, `tag:id`, or `ext:url`.
+//! A global relation matches an image when one of its tag endpoints is on the
+//! image; an item relation matches when the current item is an endpoint.
+//! Relation queries are directional: `rel:item:this@created_by@tag:artist:x`
+//! is not the same as its reverse.
 //!
 //! Tags are single tokens matching `[A-Za-z0-9_:.\-]+`. `-` is an operator
 //! only when surrounded by whitespace, so `house-cat` is one tag and
@@ -27,18 +34,450 @@
 
 use super::hierarchy::tag_key;
 use super::Hierarchy;
+use std::collections::HashMap;
+#[cfg(test)]
 use std::collections::HashSet;
+use symtropy_tags::{AssertionState, EntityRef, ProvenanceKind, RelationPredicate, TagRelation};
 use std::fmt;
+
+/// Which authority a claim came from. This is deliberately separate from
+/// confidence: a machine guess at 99% is still not a human fact.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ClaimSource {
+    Human,
+    Ai,
+    Import,
+}
+
+impl ClaimSource {
+    pub fn from_provenance(kind: ProvenanceKind) -> Self {
+        match kind {
+            // Legacy sidecars have no explicit provenance. Their accepted tags
+            // are the curated baseline, so Unknown must stay searchable there.
+            ProvenanceKind::Human | ProvenanceKind::Unknown => Self::Human,
+            ProvenanceKind::Ai | ProvenanceKind::Computed => Self::Ai,
+            ProvenanceKind::Source | ProvenanceKind::Import => Self::Import,
+        }
+    }
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Human => "human",
+            Self::Ai => "ai",
+            Self::Import => "import",
+        }
+    }
+}
+
+impl fmt::Display for ClaimSource {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+/// Which claim authorities an active filter may see. Curated is the default,
+/// so ordinary tag searches never silently include machine suggestions.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum ClaimScope {
+    #[default]
+    Curated,
+    Machine,
+    /// Used when an explicit AI query is allowed to match human tags too.
+    All,
+}
+
+impl ClaimScope {
+    pub fn accepts(self, source: ClaimSource) -> bool {
+        match self {
+            Self::Curated => source == ClaimSource::Human,
+            Self::Machine => matches!(source, ClaimSource::Ai | ClaimSource::Import),
+            Self::All => true,
+        }
+    }
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Curated => "curated",
+            Self::Machine => "machine",
+            Self::All => "all",
+        }
+    }
+}
+
+impl fmt::Display for ClaimScope {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub enum QueryEntity {
+    CurrentItem,
+    Item(String),
+    Tag(String),
+    External(String),
+}
+
+impl QueryEntity {
+    fn parse(value: &str) -> Result<Self, String> {
+        let value = value.trim();
+        if value.is_empty() {
+            return Err("relation endpoint cannot be empty".to_string());
+        }
+        if value == "this" || value == "item:this" {
+            return Ok(Self::CurrentItem);
+        }
+        if let Some(rest) = value.strip_prefix("item:") {
+            return rest
+                .is_empty()
+                .then(|| Err("item endpoint cannot be empty".to_string()))
+                .unwrap_or_else(|| Ok(Self::Item(rest.to_string())));
+        }
+        if let Some(rest) = value.strip_prefix("tag:") {
+            return rest
+                .is_empty()
+                .then(|| Err("tag endpoint cannot be empty".to_string()))
+                .unwrap_or_else(|| Ok(Self::Tag(rest.to_string())));
+        }
+        if let Some(rest) = value.strip_prefix("ext:") {
+            return rest
+                .is_empty()
+                .then(|| Err("external endpoint cannot be empty".to_string()))
+                .unwrap_or_else(|| Ok(Self::External(rest.to_string())));
+        }
+        Err(format!(
+            "relation endpoint '{}' needs item:, tag:, ext:, or this",
+            value
+        ))
+    }
+
+    fn display(&self) -> String {
+        match self {
+            Self::CurrentItem => "item:this".to_string(),
+            Self::Item(value) => format!("item:{value}"),
+            Self::Tag(value) => format!("tag:{value}"),
+            Self::External(value) => format!("ext:{value}"),
+        }
+    }
+
+    fn map_tags(&self, map: &impl Fn(&str) -> Option<String>) -> Option<Self> {
+        match self {
+            Self::Tag(tag) => map(tag).map(Self::Tag),
+            other => Some(other.clone()),
+        }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct RelationQuery {
+    pub subject: QueryEntity,
+    pub predicate: RelationPredicate,
+    pub object: QueryEntity,
+}
+
+impl RelationQuery {
+    fn parse(input: &str) -> Result<Self, String> {
+        let parts: Vec<&str> = input.split('@').collect();
+        if parts.len() != 3 {
+            return Err("relation query needs subject@predicate@object".to_string());
+        }
+        let predicate_text = parts[1].trim();
+        let predicate = RelationPredicate::parse(predicate_text);
+        const PREDICATES: &[&str] = &[
+            "related_to", "subclass_of", "part_of", "member_of", "maps_to", "aliases", "realizes",
+            "evidences", "adjacent_to", "contrasts_with", "requires_context", "implies_cue",
+            "created_by", "depicts", "located_at", "inspired_by", "derived_from",
+        ];
+        if !PREDICATES.iter().any(|name| *name == predicate_text.to_ascii_lowercase()) {
+            return Err(format!("unknown relation predicate '{}'", predicate_text));
+        }
+        Ok(Self {
+            subject: QueryEntity::parse(parts[0])?,
+            predicate,
+            object: QueryEntity::parse(parts[2])?,
+        })
+    }
+
+    fn display(&self) -> String {
+        format!(
+            "{}@{}@{}",
+            self.subject.display(),
+            self.predicate.as_str(),
+            self.object.display()
+        )
+    }
+
+    fn map_tags(&self, map: &impl Fn(&str) -> Option<String>) -> Option<Self> {
+        Some(Self {
+            subject: self.subject.map_tags(map)?,
+            predicate: self.predicate,
+            object: self.object.map_tags(map)?,
+        })
+    }
+}
 
 #[derive(Clone, Debug, PartialEq)]
 pub enum Query {
     Tag(String),
+    Relation(RelationQuery),
     Rating { min: u8, exact: bool },
     Not(Box<Query>),
     And(Vec<Query>),
     Or(Vec<Query>),
     Except(Vec<Query>),
     AlwaysTrue,
+}
+
+/// Inclusive confidence bucket used by the tag filter.
+///
+/// Accepted human claims are represented as `100`; machine/source suggestions
+/// are clamped to `0..=99`. That keeps "accepted" distinct from a model that
+/// happens to be extremely confident.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ConfidenceRange {
+    pub min: u8,
+    pub max: u8,
+}
+
+impl ConfidenceRange {
+    pub fn new(min: u8, max: u8) -> Self {
+        if min <= max {
+            Self { min, max }
+        } else {
+            Self { min: max, max: min }
+        }
+    }
+
+    pub fn accepted_only() -> Self {
+        Self { min: 100, max: 100 }
+    }
+
+    pub fn all() -> Self {
+        Self { min: 0, max: 100 }
+    }
+
+    pub fn contains(self, confidence: u8) -> bool {
+        (self.min..=self.max).contains(&confidence)
+    }
+}
+
+impl Default for ConfidenceRange {
+    fn default() -> Self {
+        Self::accepted_only()
+    }
+}
+
+impl fmt::Display for ConfidenceRange {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        if self.min == self.max {
+            write!(f, "{}%", self.min)
+        } else {
+            write!(f, "{}–{}%", self.min, self.max)
+        }
+    }
+}
+
+/// One image's effective tag confidences for filtering.
+///
+/// A tag appears once, keyed by its normalized name. Accepted claims have
+/// confidence `100`; suggestions keep their strongest score below `100`.
+#[derive(Clone, Debug)]
+struct TagClaim {
+    tag: String,
+    confidence: u8,
+    source: ClaimSource,
+}
+
+#[derive(Clone, Debug)]
+struct EvidenceRelation {
+    relation: TagRelation,
+    global: bool,
+    source: ClaimSource,
+}
+
+#[derive(Clone, Debug, Default)]
+pub struct TagEvidence {
+    item_id: String,
+    entries: HashMap<String, TagClaim>,
+    relations: Vec<EvidenceRelation>,
+}
+
+impl TagEvidence {
+    /// Sidecar tags are the curated baseline. Namespaced `src:` tags are
+    /// imported evidence and stay in the machine tier until explicitly
+    /// promoted into a normal tag.
+    pub fn from_tags<'a>(tags: impl IntoIterator<Item = &'a str>) -> Self {
+        let mut evidence = Self::default();
+        for tag in tags {
+            let source = if tag_key(tag).starts_with("src:") {
+                ClaimSource::Import
+            } else {
+                ClaimSource::Human
+            };
+            evidence.insert_with_source(tag, 100, source);
+        }
+        evidence
+    }
+
+    pub fn with_item_id(mut self, item_id: &str) -> Self {
+        self.item_id = item_id.to_string();
+        self
+    }
+
+    /// Add a relation visible to this image. Global relations only match when
+    /// one of their tag endpoints is present on the image; item relations must
+    /// involve the current item. The claim source comes from its provenance.
+    pub fn insert_relation(&mut self, relation: TagRelation, global: bool) {
+        let source = ClaimSource::from_provenance(relation.provenance.kind);
+        self.relations.push(EvidenceRelation { relation, global, source });
+    }
+
+    /// Insert an accepted human claim. Accepted wins over lower guesses.
+    #[cfg(test)]
+    pub fn insert_accepted(&mut self, tag: &str) {
+        self.insert_with_source(tag, 100, ClaimSource::Human);
+    }
+
+    /// Insert an accepted claim from an explicit authority.
+    pub fn insert_accepted_with_source(&mut self, tag: &str, source: ClaimSource) {
+        self.insert_with_source(tag, 100, source);
+    }
+
+    /// Insert an AI suggestion. Scores are clamped to `0..=99` so a suggestion
+    /// can never masquerade as a human-confirmed tag.
+    #[cfg(test)]
+    pub fn insert_suggested(&mut self, tag: &str, confidence: f32) {
+        self.insert_suggested_with_source(tag, confidence, ClaimSource::Ai);
+    }
+
+    pub fn insert_suggested_with_source(
+        &mut self,
+        tag: &str,
+        confidence: f32,
+        source: ClaimSource,
+    ) {
+        let percent = (confidence.clamp(0.0, 1.0) * 99.0).floor() as u8;
+        self.insert_with_source(tag, percent.min(99), source);
+    }
+
+    fn insert_with_source(&mut self, tag: &str, confidence: u8, source: ClaimSource) {
+        let key = tag_key(tag);
+        match self.entries.get_mut(&key) {
+            Some(existing) => {
+                // Curated facts win ties; otherwise prefer the strongest score.
+                if confidence > existing.confidence
+                    || (confidence == existing.confidence && source == ClaimSource::Human)
+                {
+                    existing.confidence = confidence;
+                    existing.source = source;
+                }
+            }
+            None => {
+                self.entries.insert(key, TagClaim {
+                    tag: tag.to_string(),
+                    confidence,
+                    source,
+                });
+            }
+        }
+    }
+
+    /// True when this image has a claim for `wanted` (or a descendant of it)
+    /// inside both the confidence range and the active claim scope.
+    pub fn contains_tag_scoped(
+        &self,
+        wanted: &str,
+        hierarchy: &Hierarchy,
+        range: ConfidenceRange,
+        scope: ClaimScope,
+    ) -> bool {
+        let wanted = tag_key(wanted);
+        self.entries.values().any(|claim| {
+            scope.accepts(claim.source)
+                && range.contains(claim.confidence)
+                && (tag_key(&claim.tag) == wanted
+                    || hierarchy.is_descendant_of(&claim.tag, &wanted))
+        })
+    }
+
+    /// Convenience for tests that intentionally search every authority.
+    #[cfg(test)]
+    pub fn contains_tag(
+        &self,
+        wanted: &str,
+        hierarchy: &Hierarchy,
+        range: ConfidenceRange,
+    ) -> bool {
+        self.contains_tag_scoped(wanted, hierarchy, range, ClaimScope::All)
+    }
+
+    pub fn contains_relation_scoped(
+        &self,
+        wanted: &RelationQuery,
+        hierarchy: &Hierarchy,
+        range: ConfidenceRange,
+        scope: ClaimScope,
+    ) -> bool {
+        self.relations.iter().any(|entry| {
+            if !scope.accepts(entry.source) {
+                return false;
+            }
+            if relation_confidence(&entry.relation, range).is_none() {
+                return false;
+            }
+            if entry.relation.predicate != wanted.predicate {
+                return false;
+            }
+            let subject = endpoint_matches(&wanted.subject, &entry.relation.subject, self);
+            let object = endpoint_matches(&wanted.object, &entry.relation.object, self);
+            if !subject || !object {
+                return false;
+            }
+            if entry.global {
+                tag_endpoint_applies(&entry.relation.subject, self, hierarchy, range, scope)
+                    || tag_endpoint_applies(&entry.relation.object, self, hierarchy, range, scope)
+            } else {
+                matches!(&entry.relation.subject, EntityRef::Item(id) if id == &self.item_id)
+                    || matches!(&entry.relation.object, EntityRef::Item(id) if id == &self.item_id)
+            }
+        })
+    }
+
+}
+
+fn relation_confidence(relation: &TagRelation, range: ConfidenceRange) -> Option<u8> {
+    match relation.state {
+        AssertionState::Accepted => Some(100),
+        AssertionState::Suggested => {
+            let percent = (relation.confidence.clamp(0.0, 1.0) * 99.0).floor() as u8;
+            Some(percent.min(99))
+        }
+        AssertionState::Rejected | AssertionState::Superseded => None,
+    }
+    .filter(|confidence| range.contains(*confidence))
+}
+
+fn endpoint_matches(wanted: &QueryEntity, endpoint: &EntityRef, evidence: &TagEvidence) -> bool {
+    match (wanted, endpoint) {
+        (QueryEntity::CurrentItem, EntityRef::Item(id)) => id == &evidence.item_id,
+        (QueryEntity::Item(id), EntityRef::Item(value)) => id == value,
+        (QueryEntity::Tag(id), EntityRef::Tag(value)) => tag_key(id) == tag_key(value),
+        (QueryEntity::External(value), EntityRef::External(endpoint)) => value == endpoint,
+        _ => false,
+    }
+}
+
+fn tag_endpoint_applies(
+    endpoint: &EntityRef,
+    evidence: &TagEvidence,
+    hierarchy: &Hierarchy,
+    range: ConfidenceRange,
+    scope: ClaimScope,
+) -> bool {
+    match endpoint {
+        EntityRef::Tag(tag) => evidence.contains_tag_scoped(tag, hierarchy, range, scope),
+        _ => false,
+    }
 }
 
 impl Query {
@@ -65,16 +504,35 @@ impl Query {
     /// `applied` is the effective tag set (explicit + all ancestors). A query
     /// for `animal` matches an image tagged `fox` because `fox` is a
     /// descendant of `animal` in the hierarchy.
+    /// Accepted-only evaluation for plain tag sets. Kept for query tests; the
+    /// gallery always uses [`Self::matches_evidence`].
+    #[cfg(test)]
     pub fn matches(&self, applied: &HashSet<String>, rating: u8, hierarchy: &Hierarchy) -> bool {
+        let evidence = TagEvidence::from_tags(applied.iter().map(String::as_str));
+        self.matches_evidence(
+            &evidence,
+            rating,
+            hierarchy,
+            ConfidenceRange::accepted_only(),
+            ClaimScope::All,
+        )
+    }
+
+    /// Evaluate against effective tag claims. The caller chooses both the
+    /// confidence bucket and which authorities are searchable. Those are
+    /// independent: a machine claim at 99% is still not a human fact.
+    pub fn matches_evidence(
+        &self,
+        evidence: &TagEvidence,
+        rating: u8,
+        hierarchy: &Hierarchy,
+        range: ConfidenceRange,
+        scope: ClaimScope,
+    ) -> bool {
         match self {
-            Query::Tag(t) => {
-                // Directly tagged or tagged with any descendant of `t`.
-                // Whitespace is normalized on both sides because taxonomy names
-                // can contain spaces while query tokens cannot.
-                let wanted = tag_key(t);
-                applied
-                    .iter()
-                    .any(|a| tag_key(a) == wanted || hierarchy.is_descendant_of(a, t))
+            Query::Tag(t) => evidence.contains_tag_scoped(t, hierarchy, range, scope),
+            Query::Relation(relation) => {
+                evidence.contains_relation_scoped(relation, hierarchy, range, scope)
             }
             Query::Rating { min, exact } => {
                 if *exact {
@@ -83,13 +541,19 @@ impl Query {
                     rating >= *min
                 }
             }
-            Query::Not(q) => !q.matches(applied, rating, hierarchy),
-            Query::And(qs) => qs.iter().all(|q| q.matches(applied, rating, hierarchy)),
-            Query::Or(qs) => qs.iter().any(|q| q.matches(applied, rating, hierarchy)),
+            Query::Not(q) => !q.matches_evidence(evidence, rating, hierarchy, range, scope),
+            Query::And(qs) => qs.iter().all(|q| {
+                q.matches_evidence(evidence, rating, hierarchy, range, scope)
+            }),
+            Query::Or(qs) => qs.iter().any(|q| {
+                q.matches_evidence(evidence, rating, hierarchy, range, scope)
+            }),
             Query::Except(qs) => {
                 let Some(first) = qs.first() else { return true };
-                first.matches(applied, rating, hierarchy)
-                    && qs[1..].iter().all(|q| !q.matches(applied, rating, hierarchy))
+                first.matches_evidence(evidence, rating, hierarchy, range, scope)
+                    && qs[1..].iter().all(|q| {
+                        !q.matches_evidence(evidence, rating, hierarchy, range, scope)
+                    })
             }
             Query::AlwaysTrue => true,
         }
@@ -101,6 +565,7 @@ impl Query {
         fn walk(q: &Query, map: &impl Fn(&str) -> Option<String>) -> Option<Query> {
             match q {
                 Query::Tag(tag) => map(tag).map(Query::Tag),
+                Query::Relation(relation) => relation.map_tags(map).map(Query::Relation),
                 Query::Rating { .. } | Query::AlwaysTrue => Some(q.clone()),
                 Query::Not(inner) => walk(inner, map).map(|inner| Query::Not(Box::new(inner))),
                 Query::And(qs) => {
@@ -130,6 +595,7 @@ impl fmt::Display for Query {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Query::Tag(t) => write!(f, "{}", t),
+            Query::Relation(relation) => write!(f, "rel:{}", relation.display()),
             Query::Rating { min, exact } => {
                 if *exact {
                     write!(f, "rating:{}", min)
@@ -161,7 +627,7 @@ fn write_joined(f: &mut fmt::Formatter<'_>, qs: &[Query], sep: &str, prec: u8) -
 /// Render `q`, wrapping in parens if its precedence is lower than `prec`.
 fn wrap(q: &Query, prec: u8) -> String {
     let own = match q {
-        Query::AlwaysTrue | Query::Tag(_) | Query::Rating { .. } => 4,
+        Query::AlwaysTrue | Query::Tag(_) | Query::Relation(_) | Query::Rating { .. } => 4,
         Query::Not(_) => 3,
         Query::And(_) | Query::Except(_) => 2,
         Query::Or(_) => 1,
@@ -224,13 +690,16 @@ fn tokenize(input: &str) -> Result<Vec<Token>, String> {
                 let mut word = String::new();
                 while i < chars.len() {
                     let c = chars[i];
-                    if c.is_whitespace() || "()|!".contains(c) {
+                    if c.is_whitespace() || "()|".contains(c) {
+                        break;
+                    }
+                    if c == '!' && !word.starts_with("rel:") {
                         break;
                     }
                     if c == '+' {
-                        // `+` is an AND operator between words, but part of the
-                        // `rating:N+` token. Keep it inside rating words.
-                        if word.starts_with("rating:") {
+                        // `+` is an AND operator between words, but part of
+                        // `rating:N+` and of URLs inside `rel:` endpoints.
+                        if word.starts_with("rating:") || word.starts_with("rel:") {
                             word.push(c);
                             i += 1;
                             continue;
@@ -357,7 +826,13 @@ impl Parser {
                 }
                 Ok(q)
             }
-            Some(Token::Word(w)) => Ok(Query::Tag(w)),
+            Some(Token::Word(w)) => {
+                if let Some(relation) = w.strip_prefix("rel:") {
+                    Ok(Query::Relation(RelationQuery::parse(relation)?))
+                } else {
+                    Ok(Query::Tag(w))
+                }
+            }
             Some(Token::Rating { min, exact }) => Ok(Query::Rating { min, exact }),
             Some(t) => Err(format!("unexpected token: {:?}", t)),
             None => Err("unexpected end of query".into()),
@@ -532,12 +1007,190 @@ mod tests {
     }
 
     #[test]
+    fn confidence_range_gates_suggestions_without_hiding_accepted_tags() {
+        let hh = h();
+        let q = Query::parse("fox").unwrap();
+        let mut evidence = TagEvidence::default();
+        evidence.insert_suggested("fox", 0.92);
+
+        assert!(!q.matches_evidence(&evidence, 0, &hh, ConfidenceRange::accepted_only(), ClaimScope::All));
+        assert!(q.matches_evidence(&evidence, 0, &hh, ConfidenceRange::new(90, 99), ClaimScope::All));
+        assert!(!q.matches_evidence(&evidence, 0, &hh, ConfidenceRange::new(0, 50), ClaimScope::All));
+
+        evidence.insert_accepted("fox");
+        assert!(q.matches_evidence(&evidence, 0, &hh, ConfidenceRange::accepted_only(), ClaimScope::All));
+        assert!(!q.matches_evidence(&evidence, 0, &hh, ConfidenceRange::new(0, 99), ClaimScope::All));
+    }
+
+    #[test]
+    fn confidence_range_applies_before_hierarchy_expansion() {
+        let hh = h();
+        let q = Query::parse("animal").unwrap();
+        let mut evidence = TagEvidence::default();
+        evidence.insert_suggested("fennec", 0.4);
+
+        assert!(q.matches_evidence(&evidence, 0, &hh, ConfidenceRange::new(0, 49), ClaimScope::All));
+        assert!(!q.matches_evidence(&evidence, 0, &hh, ConfidenceRange::new(80, 99), ClaimScope::All));
+    }
+
+    #[test]
+    fn relation_query_matches_global_relation_on_a_tagged_image() {
+        let hh = h();
+        let relation = TagRelation::new(
+            "global-realizes",
+            EntityRef::Tag("theme:ownership".to_string()),
+            RelationPredicate::Realizes,
+            EntityRef::Tag("act:possession".to_string()),
+            AssertionState::Accepted,
+            symtropy_tags::Provenance::human(),
+            1.0,
+        );
+        let mut evidence =
+            TagEvidence::from_tags(["theme:ownership"]).with_item_id("a.webp");
+        evidence.insert_relation(relation.clone(), true);
+
+        let forward = Query::parse("rel:tag:theme:ownership@realizes@tag:act:possession").unwrap();
+        let reverse = Query::parse("rel:tag:act:possession@realizes@tag:theme:ownership").unwrap();
+        assert!(forward.matches_evidence(&evidence, 0, &hh, ConfidenceRange::accepted_only(), ClaimScope::All));
+        assert!(!reverse.matches_evidence(&evidence, 0, &hh, ConfidenceRange::accepted_only(), ClaimScope::All));
+
+        let mut untagged = TagEvidence::default().with_item_id("b.webp");
+        untagged.insert_relation(relation, true);
+        assert!(!forward.matches_evidence(&untagged, 0, &hh, ConfidenceRange::accepted_only(), ClaimScope::All));
+    }
+
+    #[test]
+    fn relation_query_matches_item_relations_and_respects_confidence() {
+        let hh = h();
+        let relation = TagRelation::new(
+            "item-created-by",
+            EntityRef::Item("a.webp".to_string()),
+            RelationPredicate::CreatedBy,
+            EntityRef::Tag("artist:kitty".to_string()),
+            AssertionState::Suggested,
+            symtropy_tags::Provenance::ai("test", "v1"),
+            0.4,
+        );
+        let mut evidence = TagEvidence::default().with_item_id("a.webp");
+        evidence.insert_relation(relation, false);
+
+        let query = Query::parse("rel:item:this@created_by@tag:artist:kitty").unwrap();
+        assert!(query.matches_evidence(&evidence, 0, &hh, ConfidenceRange::new(0, 49), ClaimScope::All));
+        assert!(!query.matches_evidence(&evidence, 0, &hh, ConfidenceRange::accepted_only(), ClaimScope::All));
+    }
+
+    #[test]
+    fn relation_query_accepts_external_url_endpoints() {
+        let query = Query::parse(
+            "rel:ext:https://example.test/posts?id=7+8&q=a!b@evidences@item:this",
+        )
+        .unwrap();
+        let Query::Relation(relation) = query else { panic!("expected relation query") };
+        assert_eq!(relation.predicate, RelationPredicate::Evidences);
+        assert!(matches!(relation.subject, QueryEntity::External(url) if url == "https://example.test/posts?id=7+8&q=a!b"));
+        assert!(matches!(relation.object, QueryEntity::CurrentItem));
+    }
+
+    #[test]
+    fn rejected_relations_are_ignored() {
+        let hh = h();
+        let relation = TagRelation::new(
+            "rejected",
+            EntityRef::Item("a.webp".to_string()),
+            RelationPredicate::CreatedBy,
+            EntityRef::Tag("artist:kitty".to_string()),
+            AssertionState::Rejected,
+            symtropy_tags::Provenance::human(),
+            1.0,
+        );
+        let mut evidence = TagEvidence::default().with_item_id("a.webp");
+        evidence.insert_relation(relation, false);
+
+        let query = Query::parse("rel:item:this@created_by@tag:artist:kitty").unwrap();
+        assert!(!query.matches_evidence(&evidence, 0, &hh, ConfidenceRange::all(), ClaimScope::All));
+    }
+
+    #[test]
+    fn suggestions_never_reach_the_accepted_bucket() {
+        let hh = h();
+        let mut evidence = TagEvidence::default();
+        evidence.insert_suggested("fox", 1.0);
+
+        assert!(evidence.contains_tag("fox", &hh, ConfidenceRange::new(99, 99)));
+        assert!(!evidence.contains_tag("fox", &hh, ConfidenceRange::accepted_only()));
+    }
+
+    #[test]
+    fn claim_scope_separates_curated_facts_from_machine_guesses() {
+        let hh = h();
+        let mut curated = TagEvidence::from_tags(["fox"]);
+        curated.insert_suggested("feline", 0.95);
+
+        assert!(!Query::parse("feline").unwrap().matches_evidence(
+            &curated, 0, &hh,
+            ConfidenceRange::new(90, 99), ClaimScope::Curated,
+        ));
+        assert!(Query::parse("feline").unwrap().matches_evidence(
+            &curated, 0, &hh,
+            ConfidenceRange::new(90, 99), ClaimScope::Machine,
+        ));
+        assert!(Query::parse("fox").unwrap().matches_evidence(
+            &curated, 0, &hh,
+            ConfidenceRange::all(), ClaimScope::Curated,
+        ));
+        assert!(!Query::parse("fox").unwrap().matches_evidence(
+            &curated, 0, &hh,
+            ConfidenceRange::all(), ClaimScope::Machine,
+        ));
+    }
+
+    #[test]
+    fn namespaced_source_tags_stay_in_the_machine_tier() {
+        let hh = h();
+        let evidence = TagEvidence::from_tags(["src:e621:possession"]);
+        let query = Query::parse("src:e621:possession").unwrap();
+
+        assert!(!query.matches_evidence(
+            &evidence, 0, &hh, ConfidenceRange::all(), ClaimScope::Curated,
+        ));
+        assert!(query.matches_evidence(
+            &evidence, 0, &hh, ConfidenceRange::all(), ClaimScope::Machine,
+        ));
+    }
+
+    #[test]
+    fn relations_use_provenance_for_claim_scope() {
+        let hh = h();
+        let relation = TagRelation::new(
+            "machine-created-by",
+            EntityRef::Item("a.webp".to_string()),
+            RelationPredicate::CreatedBy,
+            EntityRef::Tag("artist:kitty".to_string()),
+            AssertionState::Accepted,
+            symtropy_tags::Provenance::ai("test", "v1"),
+            1.0,
+        );
+        let mut evidence = TagEvidence::default().with_item_id("a.webp");
+        evidence.insert_relation(relation, false);
+        let query = Query::parse("rel:item:this@created_by@tag:artist:kitty").unwrap();
+
+        assert!(!query.matches_evidence(
+            &evidence, 0, &hh, ConfidenceRange::all(), ClaimScope::Curated,
+        ));
+        assert!(query.matches_evidence(
+            &evidence, 0, &hh, ConfidenceRange::all(), ClaimScope::Machine,
+        ));
+    }
+
+    #[test]
     fn display_round_trips() {
         for s in [
             "fox",
             "fox + plush",
             "fox | wolf",
             "fox - plush",
+            "rel:item:this@created_by@tag:artist:kitty",
+            "rel:ext:https://example.test/posts?id=7+8&q=a!b@evidences@item:this",
             "!plush",
             "(fox | wolf) - plush",
             "rating:3",

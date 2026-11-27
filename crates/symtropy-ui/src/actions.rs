@@ -9,7 +9,6 @@
 use crate::file_manager::{SortDirection, SortKey};
 use egui::{Color32, DragAndDrop, PointerButton, Rect, Response, Stroke, Ui};
 use std::path::{Path, PathBuf};
-use x11rb::protocol::xproto::KeyButMask;
 
 /// A command emitted by a view and applied by the app.
 #[derive(Clone, Debug)]
@@ -43,6 +42,8 @@ pub enum Action {
 
     // Metadata and discovery
     SetRating { paths: Vec<PathBuf>, rating: u8 },
+    /// Clear `display:false` sidecar suppression so a file can be edited again.
+    ShowInGallery(Vec<PathBuf>),
     EditTag { paths: Vec<PathBuf>, remove: bool },
     ApplyTag { paths: Vec<PathBuf>, tag: String, remove: bool },
     ApplyTagToSelected { tag: String, remove: bool },
@@ -53,7 +54,15 @@ pub enum Action {
     TagCommit { kind: TagDialog, text: String },
 
     FindDuplicates,
-    ToggleSlideshow,
+    /// Open the standalone native Tag Manager viewport, optionally targeting a
+    /// specific image.
+    OpenTagManager(Option<PathBuf>),
+    /// Open or close the standalone native Tag Manager viewport.
+    ToggleTagManager,
+    /// Open the metadata-only export dialog.
+    ExportMetadataIndex,
+    /// Write the shareable metadata index to an explicit destination.
+    ExportMetadataCommit { path: PathBuf },
 
     CopyPath(PathBuf),
     ToggleBookmark(PathBuf),
@@ -136,6 +145,11 @@ pub enum Click {
 /// double-click isn't also reported as a plain click, and a right-drag isn't
 /// mistaken for a context menu.
 pub fn classify(ui: &Ui, response: &Response) -> Option<Click> {
+    // Once the compositor owns a native drag, egui may never see the button
+    // release. Ignore the stale button state until the drag finishes.
+    if crate::wayland_drag::is_active() {
+        return None;
+    }
     // Read the response flags before taking the input lock. Response helpers
     // such as `double_clicked()` call `ctx.input()` themselves, and nesting
     // those calls while this closure holds the lock can clear the pointer
@@ -200,23 +214,23 @@ pub fn begin_drag(ui: &Ui, paths: Vec<PathBuf>) {
         return;
     }
     let copy = ui.input(|i| i.modifiers.ctrl);
-    // Keep egui's in-process payload for drops inside Symtropy. The XDND bridge
-    // stays idle until the pointer actually leaves our windows, so internal
+    // Keep egui's in-process payload for drops inside Symtropy. The native
+    // drag only starts once the pointer leaves our viewport, so internal
     // move/copy/trash behavior is unchanged.
-    crate::drag_source::begin_drag(&paths, copy, KeyButMask::BUTTON3);
+    crate::wayland_drag::begin_drag(&paths, true);
     DragAndDrop::set_payload(ui.ctx(), DragPayload { paths, copy });
     ui.ctx().request_repaint();
 }
 
 /// Arm the OS drag source for a left-drag on an entry, without creating an
-/// egui payload. Left-drag must keep scrolling/selecting normally inside the
-/// app; the XDND bridge only takes over if the pointer leaves our windows.
+/// egui payload. Left-drag keeps scrolling/selecting normally inside the app;
+/// the compositor only takes over if the pointer leaves our windows.
 pub fn begin_external_drag(ui: &Ui, paths: Vec<PathBuf>) {
     if paths.is_empty() {
         return;
     }
-    let copy = ui.input(|i| i.modifiers.ctrl);
-    crate::drag_source::begin_drag(&paths, copy, KeyButMask::BUTTON1);
+    crate::wayland_drag::begin_drag(&paths, false);
+    ui.ctx().request_repaint();
 }
 
 /// Take the drag payload if the pointer was released over `response`.
@@ -274,6 +288,9 @@ pub fn paint_drop_target(ui: &Ui, response: &Response) {
 /// would fight a right-button file drag. Views turn it off and call this for
 /// primary-button dragging instead.
 pub fn primary_drag_scroll(ui: &Ui, rect: Rect, offset: &mut f32) {
+    if crate::wayland_drag::is_active() {
+        return;
+    }
     let (down, secondary, ctrl, dragging, pos, delta_y) = ui.input(|i| {
         let p = &i.pointer;
         (
@@ -414,10 +431,15 @@ pub fn menu_entries(target: &ContextTarget, options: MenuOptions) -> Vec<MenuEnt
             }
             entries.push(item("Duplicate", Action::Duplicate(paths.clone())));
             entries.push(item("Properties", Action::Properties(paths.clone())));
+            entries.push(item(
+                "Tag Manager",
+                Action::OpenTagManager(paths.iter().find(|path| !path.is_dir()).cloned()),
+            ));
             entries.push(MenuEntry::Separator);
 
             let image_paths: Vec<PathBuf> = paths.iter().filter(|p| !p.is_dir()).cloned().collect();
             if !image_paths.is_empty() {
+                entries.push(item("Show in Gallery", Action::ShowInGallery(image_paths.clone())));
                 entries.push(item("Clear Rating", Action::SetRating { paths: image_paths.clone(), rating: 0 }));
                 for rating in 1..=5u8 {
                     entries.push(item(
@@ -451,7 +473,8 @@ pub fn menu_entries(target: &ContextTarget, options: MenuOptions) -> Vec<MenuEnt
             entries.push(item("Open Terminal Here", Action::OpenTerminal(dir.clone())));
             entries.push(item(bookmark_label, Action::ToggleBookmark(dir.clone())));
             entries.push(item("Find Duplicates…", Action::FindDuplicates));
-            entries.push(item("Slideshow", Action::ToggleSlideshow));
+            entries.push(item("Tag Manager", Action::OpenTagManager(None)));
+            entries.push(item("Export Metadata Index…", Action::ExportMetadataIndex));
             entries.push(MenuEntry::Separator);
         }
     }
@@ -651,11 +674,20 @@ mod tests {
         ];
         let target = ContextTarget::Entries(paths);
         assert_eq!(target.directory(), PathBuf::from("/tmp/library"));
-        let labels = labels(menu_entries(&target, MenuOptions::default()));
+        let entries = menu_entries(&target, MenuOptions::default());
+        let labels = labels(entries.clone());
         assert!(labels.contains(&"Move 2 Items to Trash".to_string()));
         assert!(labels.contains(&"Add Bookmark".to_string()));
         assert!(labels.contains(&"Select Inverse".to_string()));
         assert!(labels.contains(&"Properties".to_string()));
+        assert!(labels.contains(&"Show in Gallery".to_string()));
+        assert!(entries.iter().any(|e| matches!(
+            e,
+            MenuEntry::Item(MenuItem {
+                action: Action::OpenTagManager(Some(_)),
+                ..
+            })
+        )));
     }
 
     #[test]
@@ -668,6 +700,8 @@ mod tests {
         let labels = labels(entries.clone());
         assert!(labels.contains(&"Remove Bookmark".to_string()));
         assert!(labels.contains(&"New Folder…".to_string()));
+        assert!(labels.contains(&"Export Metadata Index…".to_string()));
+        assert!(labels.contains(&"Tag Manager".to_string()));
         assert!(!entries.iter().any(|e| matches!(
             e,
             MenuEntry::Item(MenuItem {

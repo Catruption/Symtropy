@@ -28,7 +28,7 @@ pub struct TagNode {
 }
 
 /// The parsed hierarchy.
-#[derive(Debug, Default)]
+#[derive(Clone, Debug, Default)]
 pub struct Hierarchy {
     nodes: HashMap<String, TagNode>,
     roots: Vec<String>,
@@ -46,6 +46,24 @@ impl Hierarchy {
 
     pub fn node(&self, tag: &str) -> Option<&TagNode> {
         self.nodes.get(tag)
+    }
+
+    /// True when a tag with this normalized key is present in the taxonomy.
+    pub fn contains_key(&self, tag: &str) -> bool {
+        self.ancestors_by_key.contains_key(&tag_key(tag))
+    }
+
+    /// Every normalized tag key in the taxonomy.
+    pub fn keys(&self) -> Vec<String> {
+        self.ancestors_by_key.keys().cloned().collect()
+    }
+
+    /// The stored spelling of a tag with this normalized key. Sidecars may use
+    /// underscores where `tags.txt` uses spaces; hierarchy edits need the
+    /// canonical spelling for the raw node lookup.
+    pub fn name_for_key(&self, tag: &str) -> Option<&str> {
+        let key = tag_key(tag);
+        self.nodes.keys().find(|name| tag_key(name) == key).map(String::as_str)
     }
 
     /// Is `child` at or below `parent`? A tag counts as its own descendant,
@@ -126,6 +144,39 @@ impl Hierarchy {
         }
         self.reindex();
         Ok(())
+    }
+
+    /// Add many tags at once, reindexing only once. Inserting one tag at a time
+    /// cloned and walked the whole taxonomy each call, which stalled the UI
+    /// when a folder introduced thousands of sidecar-only artist tags.
+    pub fn insert_batch(&mut self, tags: Vec<(String, Option<String>)>) {
+        if tags.is_empty() {
+            return;
+        }
+        for (name, parent) in tags {
+            let Ok(name) = valid_name(&name) else { continue };
+            if self.nodes.keys().any(|existing| tag_key(existing) == tag_key(&name)) {
+                continue;
+            }
+            let parent = parent
+                .as_deref()
+                .and_then(|p| valid_name(p).ok())
+                .filter(|p| !p.is_empty());
+            if let Some(p) = &parent {
+                if !self.nodes.contains_key(p) {
+                    continue;
+                }
+            }
+            self.nodes.insert(name.clone(), TagNode { children: Vec::new() });
+            if let Some(p) = parent {
+                if let Some(node) = self.nodes.get_mut(&p) {
+                    node.children.push(name);
+                }
+            } else {
+                self.roots.push(name);
+            }
+        }
+        self.reindex();
     }
 
     /// Rename a tag everywhere it appears, preserving its position.
@@ -356,11 +407,19 @@ impl Hierarchy {
 
             let parent = stack.last().map(|(_, n)| n.clone());
 
-            if nodes.contains_key(name) {
+            if let Some(canonical) = nodes
+                .keys()
+                .find(|existing| tag_key(existing) == tag_key(name))
+                .cloned()
+            {
                 eprintln!(
                     "hierarchy: duplicate tag '{}' at depth {}, keeping first occurrence",
                     name, depth
                 );
+                // Keep the children of a repeated heading attached to the
+                // original node. Skipping the line without updating the stack
+                // silently promotes those children to unrelated roots.
+                stack.push((depth, canonical));
                 continue;
             }
 
@@ -447,6 +506,22 @@ artist
 \taccelldraws
 \t6unnnya
 ";
+
+    #[test]
+    fn batch_insert_keeps_parent_links_and_avoids_duplicate_roots() {
+        let mut h = Hierarchy::parse("animal\n  feline\n");
+        h.insert_batch(vec![
+            ("house-cat".into(), Some("feline".into())),
+            ("feline".into(), None),
+            ("thunderclan".into(), Some("feline".into())),
+        ]);
+
+        assert!(h.is_descendant_of("house-cat", "feline"));
+        assert!(h.is_descendant_of("thunderclan", "feline"));
+        assert_eq!(h.parent_of("feline").as_deref(), Some("animal"));
+        assert_eq!(h.roots().iter().filter(|root| *root == "feline").count(), 0);
+        assert!(!h.roots().iter().any(|root| root == "house-cat"));
+    }
 
     #[test]
     fn parses_all() {

@@ -31,7 +31,16 @@ impl Bookmarks {
 #[derive(Clone, PartialEq)]
 pub enum ViewMode {
     List,
+    /// Uniform-height rows. Cheap to lay out and scan.
     Gallery,
+    /// Variable-height aspect-preserving mosaic.
+    Masonry,
+}
+
+impl ViewMode {
+    pub fn is_gallery(&self) -> bool {
+        !matches!(self, Self::List)
+    }
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -115,7 +124,7 @@ pub fn file_kind(path: &Path, is_dir: bool) -> FileKind {
         return FileKind::Other;
     }
     let ext = normalized_ext(path);
-    const IMAGE: &[&str] = &["jpg", "jpeg", "png", "gif", "webp", "bmp", "tif", "tiff", "heic", "heif", "avif", "ico", "svg"];
+    const IMAGE: &[&str] = &["jpg", "jpeg", "png", "gif", "webp", "bmp", "tif", "tiff", "heic", "heif", "avif", "ico", "svg", "ssvg"];
     const VIDEO: &[&str] = &["mp4", "m4v", "webm", "mkv", "avi", "mov", "wmv", "flv", "mpeg", "mpg"];
     const AUDIO: &[&str] = &["mp3", "wav", "flac", "aac", "ogg", "opus", "m4a"];
     const DOCUMENT: &[&str] = &["txt", "md", "pdf", "doc", "docx", "rtf", "odt", "csv", "json", "xml"];
@@ -209,11 +218,15 @@ pub struct FileManagerState {
     pub view_mode: ViewMode,
     pub show_hidden: bool,
     pub search_query: String,
+    pub(crate) last_search_query: String,
     pub mounts: Vec<PathBuf>,
     pub bookmarks: Bookmarks,
     pub sort: SortKey,
     pub sort_direction: SortDirection,
     pub list_scroll_offset: f32,
+    /// Rating/size/date values already present in the gallery index. Keeps a
+    /// directory switch from re-reading thousands of sidecars on the UI thread.
+    meta_cache: HashMap<PathBuf, (u64, i64)>,
 }
 
 impl FileManagerState {
@@ -228,11 +241,13 @@ impl FileManagerState {
             view_mode: ViewMode::List,
             show_hidden: false,
             search_query: String::new(),
+            last_search_query: String::new(),
             mounts: Vec::new(),
             bookmarks: Bookmarks::load(),
             sort: SortKey::default(),
             sort_direction: SortKey::default().default_direction(),
             list_scroll_offset: 0.0,
+            meta_cache: HashMap::new(),
         };
         s.refresh_mounts();
         s.navigate_to(s.current_dir.clone());
@@ -252,6 +267,7 @@ impl FileManagerState {
         self.selected.clear();
         self.selection_anchor = None;
         self.search_query.clear();
+        self.last_search_query.clear();
         self.list_scroll_offset = 0.0;
 
         if self.history.is_empty() || self.history[self.history_idx] != path {
@@ -293,7 +309,14 @@ impl FileManagerState {
         let meta: HashMap<PathBuf, (u64, i64)> = self
             .entries
             .iter()
-            .map(|entry| (entry.path.clone(), metadata_key(&entry.path)))
+            .map(|entry| {
+                let value = self
+                    .meta_cache
+                    .get(&entry.path)
+                    .copied()
+                    .unwrap_or_else(|| metadata_key(&entry.path));
+                (entry.path.clone(), value)
+            })
             .collect();
         let sort = self.sort;
         let direction = self.sort_direction;
@@ -325,6 +348,10 @@ impl FileManagerState {
 
     pub fn refresh(&mut self) {
         self.entries.clear();
+        self.meta_cache.clear();
+        let index_meta = crate::gallery::workers::cached_file_meta(
+            &crate::paths::cache_dir().join("index.tsv"),
+        );
         if let Ok(rd) = fs::read_dir(&self.current_dir) {
             for entry in rd.flatten() {
                 let name = entry.file_name().to_string_lossy().to_string();
@@ -334,7 +361,18 @@ impl FileManagerState {
                 }
                 let path = entry.path();
                 let is_dir = path.is_dir();
-                let rating = if is_dir { 0 } else { crate::gallery::sidecar::Sidecar::quick_rating(&path) };
+                let cached = index_meta.get(&path).copied();
+                let rating = if is_dir {
+                    0
+                } else {
+                    cached
+                        .map(|meta| meta.rating)
+                        .unwrap_or_else(|| crate::gallery::sidecar::Sidecar::quick_rating(&path))
+                };
+                let sort_meta = cached
+                    .map(|meta| (meta.len, meta.modified))
+                    .unwrap_or_else(|| metadata_key(&path));
+                self.meta_cache.insert(path.clone(), sort_meta);
                 self.entries.push(FileEntry {
                     name,
                     path,
@@ -347,12 +385,17 @@ impl FileManagerState {
     }
 
     pub fn search_recursive(&mut self) {
+        self.last_search_query = self.search_query.clone();
         if self.search_query.is_empty() {
             self.refresh();
             return;
         }
         let query = self.search_query.to_lowercase();
         self.entries.clear();
+        self.meta_cache.clear();
+        let index_meta = crate::gallery::workers::cached_file_meta(
+            &crate::paths::cache_dir().join("index.tsv"),
+        );
 
         let mut stack = vec![self.current_dir.clone()];
         while let Some(dir) = stack.pop() {
@@ -366,7 +409,18 @@ impl FileManagerState {
                     if name.to_lowercase().contains(&query) {
                         let path = entry.path();
                         let is_dir = path.is_dir();
-                        let rating = if is_dir { 0 } else { crate::gallery::sidecar::Sidecar::quick_rating(&path) };
+                        let cached = index_meta.get(&path).copied();
+                        let rating = if is_dir {
+                            0
+                        } else {
+                            cached
+                                .map(|meta| meta.rating)
+                                .unwrap_or_else(|| crate::gallery::sidecar::Sidecar::quick_rating(&path))
+                        };
+                        let sort_meta = cached
+                            .map(|meta| (meta.len, meta.modified))
+                            .unwrap_or_else(|| metadata_key(&path));
+                        self.meta_cache.insert(path.clone(), sort_meta);
                         self.entries.push(FileEntry {
                             name: name.clone(),
                             path,
@@ -767,5 +821,11 @@ mod tests {
 
         entries.sort_by(|a, b| compare_sortable(a, b, SortKey::Name, SortDirection::Descending));
         assert_eq!(names(&entries), vec!["folder", "z.png", "a.png", "m.mp4"]);
+    }
+
+    #[test]
+    fn composites_sort_with_images() {
+        assert_eq!(file_kind(Path::new("Art.SSVG"), false), FileKind::Image);
+        assert_eq!(file_kind(Path::new("art.ssvg"), false), FileKind::Image);
     }
 }

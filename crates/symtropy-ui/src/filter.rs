@@ -81,6 +81,23 @@ impl FilterBatch {
     }
 }
 
+/// Convert an egui clip rectangle to the OpenGL scissor box.
+///
+/// This matches `egui_glow`'s own conversion so the custom filter pass can clip
+/// with the same bounds as ordinary egui shapes.
+fn scissor_px(screen_px: [u32; 2], ppp: f32, clip: Rect) -> [i32; 4] {
+    let [width_px, height_px] = screen_px;
+    let min_x = (ppp * clip.min.x).round() as i32;
+    let min_y = (ppp * clip.min.y).round() as i32;
+    let max_x = (ppp * clip.max.x).round() as i32;
+    let max_y = (ppp * clip.max.y).round() as i32;
+    let min_x = min_x.clamp(0, width_px as i32);
+    let min_y = min_y.clamp(0, height_px as i32);
+    let max_x = max_x.clamp(min_x, width_px as i32);
+    let max_y = max_y.clamp(min_y, height_px as i32);
+    [min_x, height_px as i32 - max_y, max_x - min_x, max_y - min_y]
+}
+
 const VS: &str = r#"#version 330 core
 layout(location = 0) in vec2 a_pos;
 layout(location = 1) in vec2 a_uv;
@@ -206,9 +223,15 @@ vec3 apply(vec3 c) {
                     };
                     let [sw, sh] = info.screen_size_px;
                     let ppp = info.pixels_per_point;
+                    let scissor = scissor_px(info.screen_size_px, ppp, info.clip_rect);
+                    if scissor[2] <= 0 || scissor[3] <= 0 {
+                        return;
+                    }
 
                     let mut prev_vp = [0i32; 4];
+                    let mut prev_scissor_box = [0i32; 4];
                     gl.get_parameter_i32_slice(glow::VIEWPORT, &mut prev_vp);
+                    gl.get_parameter_i32_slice(glow::SCISSOR_BOX, &mut prev_scissor_box);
                     let prev_scissor = gl.is_enabled(glow::SCISSOR_TEST);
                     gl.viewport(0, 0, sw as i32, sh as i32);
                     gl.disable(glow::SCISSOR_TEST);
@@ -216,12 +239,32 @@ vec3 apply(vec3 c) {
                     gl.active_texture(glow::TEXTURE1);
                     gl.bind_texture(glow::TEXTURE_2D, Some(self.back));
                     let size = [sw as i32, sh as i32];
-                    if size == self.back_size {
-                        gl.copy_tex_sub_image_2d(glow::TEXTURE_2D, 0, 0, 0, 0, 0, sw as i32, sh as i32);
-                    } else {
-                        gl.copy_tex_image_2d(glow::TEXTURE_2D, 0, glow::RGBA, 0, 0, sw as i32, sh as i32, 0);
+                    if size != self.back_size {
+                        gl.tex_image_2d(
+                            glow::TEXTURE_2D,
+                            0,
+                            glow::RGBA as i32,
+                            sw as i32,
+                            sh as i32,
+                            0,
+                            glow::RGBA,
+                            glow::UNSIGNED_BYTE,
+                            None,
+                        );
                         self.back_size = size;
                     }
+                    // Only the visible gallery region is needed. Copying the whole
+                    // framebuffer every frame was a major resize/animation cost.
+                    gl.copy_tex_sub_image_2d(
+                        glow::TEXTURE_2D,
+                        0,
+                        scissor[0],
+                        scissor[1],
+                        scissor[0],
+                        scissor[1],
+                        scissor[2],
+                        scissor[3],
+                    );
 
                     gl.active_texture(glow::TEXTURE0);
                     gl.bind_texture(glow::TEXTURE_2D, Some(font_tex));
@@ -240,14 +283,28 @@ vec3 apply(vec3 c) {
                                                            verts.len() * std::mem::size_of::<Vertex>(),
                     );
                     gl.buffer_data_u8_slice(glow::ARRAY_BUFFER, bytes, glow::STREAM_DRAW);
+
+                    // egui's scissor is disabled above so the framebuffer region can
+                    // be copied. Reapply it here; otherwise masked previews outside
+                    // the gallery viewport get drawn over the rest of the window.
+                    gl.enable(glow::SCISSOR_TEST);
+                    gl.scissor(scissor[0], scissor[1], scissor[2], scissor[3]);
                     gl.draw_arrays(glow::TRIANGLES, 0, verts.len() as i32);
+
+                    gl.disable(glow::SCISSOR_TEST);
+                    gl.scissor(
+                        prev_scissor_box[0],
+                        prev_scissor_box[1],
+                        prev_scissor_box[2],
+                        prev_scissor_box[3],
+                    );
+                    if prev_scissor {
+                        gl.enable(glow::SCISSOR_TEST);
+                    }
                     gl.enable(glow::BLEND);
                     gl.active_texture(glow::TEXTURE0);
 
                     gl.viewport(prev_vp[0], prev_vp[1], prev_vp[2], prev_vp[3]);
-                    if prev_scissor {
-                        gl.enable(glow::SCISSOR_TEST);
-                    }
                 }
             }
 
@@ -257,8 +314,12 @@ vec3 apply(vec3 c) {
             }
 
             impl FilterPass {
-                pub fn paint(&self, ui: &Ui, batch: FilterBatch) {
+                pub fn paint(&self, ui: &Ui, batch: FilterBatch, clip_rect: Rect) {
                     if batch.len() == 0 {
+                        return;
+                    }
+                    let clip_rect = clip_rect.intersect(ui.clip_rect());
+                    if !clip_rect.is_positive() {
                         return;
                     }
                     let verts = Arc::new(batch.verts);
@@ -270,9 +331,30 @@ vec3 apply(vec3 c) {
                         let st = guard.get_or_insert_with(|| unsafe { GlState::new(gl) });
                         unsafe { st.draw(gl, painter, &info, &verts, tex_id) };
                     });
-                    ui.painter().add(egui::Shape::Callback(egui::PaintCallback {
-                        rect: ui.ctx().screen_rect(),
-                                                           callback: Arc::new(cb),
+                    // A cloned painter carries the gallery viewport as its clip rect,
+                    // so the GL callback receives it in `PaintCallbackInfo`.
+                    let mut painter = ui.painter().clone();
+                    painter.set_clip_rect(clip_rect);
+                    painter.add(egui::Shape::Callback(egui::PaintCallback {
+                        rect: clip_rect,
+                        callback: Arc::new(cb),
                     }));
                 }
             }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn filter_scissor_matches_egui_clip_pixels() {
+        let clip = Rect::from_min_max(pos2(10.0, 20.0), pos2(40.0, 50.0));
+        assert_eq!(scissor_px([100, 100], 2.0, clip), [20, 0, 60, 60]);
+    }
+
+    #[test]
+    fn filter_scissor_clamps_offscreen_clips() {
+        let clip = Rect::from_min_max(pos2(90.0, 10.0), pos2(200.0, 50.0));
+        assert_eq!(scissor_px([100, 100], 2.0, clip), [100, 0, 0, 80]);
+    }
+}

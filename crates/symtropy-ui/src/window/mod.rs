@@ -1,7 +1,8 @@
-//! The steel window chrome. The OS window is transparent and undecorated, and it is bigger than
-//! the visible plate by a fixed `overhang()` band on every side. That band is where decorations
-//! stick out. The compositor is told (via _GTK_FRAME_EXTENTS, see x11.rs) that the band is
-//! invisible shadow, so it tiles/maximizes/snaps the *plate*, not the whole OS window.
+//! The steel window chrome. The Wayland surface is transparent and undecorated, and it is bigger
+//! than the visible plate by a fixed `overhang()` band on every side. That band is where
+//! decorations stick out. The patched winit backend reports the plate through
+//! `xdg_surface.set_window_geometry`, so the compositor tiles/maximizes/snaps the plate, not the
+//! whole surface.
 //!
 //! Decorative texture scale is deliberately confined to `render.rs`. Buttons, drag bands,
 //! resize bands, and gutter sliders are computed from the stable plate and never follow the
@@ -24,8 +25,8 @@ pub const OVERHANG: f32 = 90.0;
 ///
 /// This is a fixed logical band: `OVERHANG` texture pixels converted with the theme's layout
 /// scale (1 / pixels-per-point). It deliberately does not use the decorative frame scale, so
-/// changing that slider cannot resize the plate, move the gutter sliders, or change the X11 frame
-/// extents that feed back into the window manager.
+/// changing that slider cannot resize the plate, move the gutter sliders, or change the window
+/// geometry reported to the compositor.
 pub fn overhang(theme: &Theme) -> f32 {
     OVERHANG * theme.scale()
 }
@@ -37,8 +38,8 @@ pub fn show(ctx: &egui::Context, theme: &Theme, title: &str, add_content: impl F
         let (maximized, fullscreen) =
         ctx.input(|i| (i.viewport().maximized.unwrap_or(false), i.viewport().fullscreen.unwrap_or(false)));
         let side = theme.side(screen.size());
-        // The plate is the OS window minus the overhang band. Only true fullscreen (where the WM
-        // ignores frame extents) fills the whole viewport.
+        // The plate is the surface minus the overhang band. In true fullscreen the compositor
+        // has no room for the band, so the plate fills the whole viewport.
         let plate = if fullscreen { screen } else { screen.shrink(overhang(theme)) };
         let frame = plate.expand(side); // decorative only; plate itself never follows this value
         let layout = layout::compute(screen, plate, theme);

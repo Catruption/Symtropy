@@ -79,6 +79,35 @@ fn image_dimensions(path: &Path) -> Option<(u32, u32)> {
         .ok()
 }
 
+fn is_ssvg_path(path: &Path) -> bool {
+    path.extension()
+        .and_then(|ext| ext.to_str())
+        .map(|ext| ext.eq_ignore_ascii_case("ssvg"))
+        .unwrap_or(false)
+}
+
+/// Dimensions from the package manifest, not from a guessed image header.
+/// Only the manifest and preview are read; layer assets are skipped.
+fn ssvg_dimensions(path: &Path) -> Option<(u32, u32)> {
+    let file = std::fs::File::open(path).ok()?;
+    let (manifest, _) = ssvg::Package::read_preview_from(file).ok()?;
+    Some((manifest.canvas.width, manifest.canvas.height))
+}
+
+fn content_dimensions(path: &Path) -> Option<(u32, u32)> {
+    if is_ssvg_path(path) {
+        return ssvg_dimensions(path);
+    }
+    image_dimensions(path)
+}
+
+/// Decode the baked preview image without loading the layer stack.
+fn ssvg_preview(path: &Path) -> Option<image::DynamicImage> {
+    let file = std::fs::File::open(path).ok()?;
+    let (_, preview) = ssvg::Package::read_preview_from(file).ok()?;
+    image::load_from_memory(&preview).ok()
+}
+
 pub fn is_video_ext(ext: &str) -> bool {
     let ext = ext.to_ascii_lowercase();
     VIDEO_EXTS.iter().any(|candidate| *candidate == ext)
@@ -282,6 +311,16 @@ fn write_index_if_changed(path: &Path, text: &str) -> std::io::Result<bool> {
     Ok(true)
 }
 
+fn static_thumb(img: image::RgbaImage, px: [u32; 2]) -> Option<WorkerThumbContent> {
+    let resized = if img.width() == px[0] && img.height() == px[1] {
+        img
+    } else {
+        image::imageops::resize(&img, px[0], px[1], image::imageops::FilterType::Triangle)
+    };
+    let size = [resized.width() as usize, resized.height() as usize];
+    Some(WorkerThumbContent::Static(egui::ColorImage::from_rgba_unmultiplied(size, resized.as_raw())))
+}
+
 pub fn make_thumb(
     path: &str,
     px: [u32; 2],
@@ -294,6 +333,10 @@ pub fn make_thumb(
         .to_lowercase();
     if is_video_ext(&ext) {
         return make_video_thumb(path, duration);
+    }
+
+    if ext == "ssvg" {
+        return static_thumb(ssvg_preview(Path::new(path))?.to_rgba8(), px);
     }
 
     let bytes = std::fs::read(path).ok()?;
@@ -334,15 +377,7 @@ pub fn make_thumb(
     let img = image::ImageReader::open(path).ok()?
     .with_guessed_format().ok()?
     .decode().ok()?;
-    let rgba = img.to_rgba8();
-    let resized = if rgba.width() == px[0] && rgba.height() == px[1] {
-        rgba
-    } else {
-        image::imageops::resize(&rgba, px[0], px[1], image::imageops::FilterType::Triangle)
-    };
-    let size = [resized.width() as usize, resized.height() as usize];
-    let ci = egui::ColorImage::from_rgba_unmultiplied(size, resized.as_raw());
-    Some(WorkerThumbContent::Static(ci))
+    static_thumb(img.to_rgba8(), px)
 }
 
 fn same_colour(a: [u8; 4], b: [u8; 4]) -> bool {
@@ -408,10 +443,17 @@ fn analyse_margins(base: &image::RgbaImage, orig_w: u32, orig_h: u32) -> (Margin
 }
 
 fn analyse_file(path: &str, w: u32, h: u32) -> (Margins, BorderColors) {
-    match image::ImageReader::open(path)
+    let decoded = if is_ssvg_path(Path::new(path)) {
+        ssvg_preview(Path::new(path))
+    } else {
+        None
+    };
+    match decoded.or_else(|| {
+        image::ImageReader::open(path)
     .ok()
     .and_then(|r| r.with_guessed_format().ok())
     .and_then(|r| r.decode().ok())
+    })
     {
         Some(img) => {
             let small = img.thumbnail(ANALYSIS_PX, ANALYSIS_PX);
@@ -520,6 +562,32 @@ type MarginJob = (String, u32, u32);
 /// cycle must be serialized. Otherwise a later writer can restore a stale
 /// snapshot and silently wipe another folder's cached rows.
 static INDEX_LOCK: Mutex<()> = Mutex::new(());
+
+/// File-manager metadata that is already stored in the global index.
+///
+/// Directory switches used to stat every file and read/parse every sidecar just
+/// to show a rating. On a 30k-image folder that stalled the UI long enough to
+/// look frozen, so the list now reuses the index and only touches disk for
+/// entries the index does not know about.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct CachedFileMeta {
+    pub rating: u8,
+    pub len: u64,
+    pub modified: i64,
+}
+
+pub fn cached_file_meta(index_path: &Path) -> HashMap<PathBuf, CachedFileMeta> {
+    load_index(index_path)
+        .into_iter()
+        .map(|(path, entry)| {
+            (PathBuf::from(path), CachedFileMeta {
+                rating: entry.rating,
+                len: entry.len,
+                modified: entry.mtime as i64,
+            })
+        })
+        .collect()
+}
 
 /// Count indexed images directly inside each directory.
 ///
@@ -668,6 +736,71 @@ fn write_scanned_index_rows(
     mutate_index(path, |old_text| {
         Some(merge_index_rows(old_text, dir, scanned_rows))
     })
+}
+
+/// Build lightweight gallery items for images in descendant folders.
+///
+/// Recursive tag search deliberately reuses the global index instead of
+/// re-reading sidecars: the index already holds the active tags, rating,
+/// dimensions and suppression state for every file the app has scanned.
+/// Files already present in the current folder are skipped by the caller's
+/// `existing` set so a recursive result never shows a duplicate.
+pub fn recursive_index_items(
+    index_path: &Path,
+    root: &Path,
+    existing: &HashSet<String>,
+) -> Vec<GalleryItem> {
+    let mut out = Vec::new();
+    for (path, entry) in load_index(index_path) {
+        if existing.contains(&path) {
+            continue;
+        }
+        let file = Path::new(&path);
+        if file.parent() == Some(root) || !file.starts_with(root) || !file.is_file() {
+            continue;
+        }
+        let name = file.file_name().unwrap_or_default().to_string_lossy().to_string();
+        if name.starts_with('.') {
+            continue;
+        }
+
+        let mut sidecar = Sidecar {
+            tags: entry.tags.clone(),
+            rating: entry.rating,
+            width: Some(entry.w),
+            height: Some(entry.h),
+            is_animated: Some(entry.is_animated),
+            ..Sidecar::default()
+        };
+        entry.extra.apply_to(&mut sidecar);
+        if sidecar.is_display_suppressed() {
+            continue;
+        }
+        if let Some((margins, colors)) = entry.analysis.clone() {
+            sidecar.margins = Some(margins);
+            sidecar.border_colors = Some(colors);
+        }
+
+        let ext = file.extension().unwrap_or_default().to_string_lossy().to_lowercase();
+        let aspect_ratio = if entry.h > 0 { entry.w as f32 / entry.h as f32 } else { 1.0 };
+        let tags = sidecar.active_tags().into_iter().collect();
+        out.push(GalleryItem {
+            id: path.clone(),
+            title: name,
+            path,
+            is_folder: false,
+            ext,
+            aspect_ratio,
+            width: entry.w as f32,
+            height: entry.h as f32,
+            border_colors: sidecar.border_colors.clone().unwrap_or_default(),
+            margins: sidecar.margins.unwrap_or_default(),
+            rating: entry.rating,
+            tags,
+            sidecar,
+        });
+    }
+    out
 }
 
 fn index_line_with_sidecar(line: &str, sc: &Sidecar) -> Option<String> {
@@ -1020,7 +1153,7 @@ pub fn scan_worker(
                         } else {
                             match old.get(&path_str) {
                                 Some(e) if e.mtime == mtime && e.len == len => Some((e.w, e.h)),
-                                                                                  _ => image_dimensions(&path),
+                                                                                  _ => content_dimensions(&path),
                             }
                         };
                         let Some((w, h)) = dims else { return };
@@ -1064,11 +1197,12 @@ pub fn scan_worker(
                             let _ = sidecar.save(Path::new(&path_str));
                         }
 
-                        let tags: HashSet<String> = sidecar.tags.iter().cloned().collect();
+                        let active_tags = sidecar.active_tags();
+                        let tags: HashSet<String> = active_tags.iter().cloned().collect();
                         let rating = sidecar.rating;
 
                         if !path_str.contains('\t') && !path_str.contains('\n') {
-                            let tags_str = if sidecar.tags.is_empty() { "-".to_string() } else { sidecar.tags.join("|") };
+                            let tags_str = if active_tags.is_empty() { "-".to_string() } else { active_tags.join("|") };
                             let extra_str = SidecarExtra::encode(&sidecar);
                             if has_cached_analysis {
                                 local_index.push_str(&format!(
@@ -1091,6 +1225,12 @@ pub fn scan_worker(
                                         rating, tags_str, extra_str
                                 ));
                             }
+                        }
+
+                        // Suppressed files still get an index row above so their
+                        // metadata survives, but they never enter the gallery.
+                        if sidecar.is_display_suppressed() {
+                            return;
                         }
 
                         let aspect = if h > 0 { w as f32 / h as f32 } else { 1.0 };
@@ -1333,6 +1473,24 @@ mod tests {
     }
 
     #[test]
+    fn cached_file_meta_uses_index_values_without_reading_sidecars() {
+        let dir = scratch("cached-meta");
+        let path = dir.join("index.tsv");
+        std::fs::write(
+            &path,
+            format!("#{}\n/library/a.webp\t1700000000\t4096\t0\t10\t20\t0\t0\t0\t0\t-\t-\t-\t-\t5\tfeline\t{{}}\n", INDEX_VERSION),
+        )
+        .unwrap();
+
+        let meta = cached_file_meta(&path);
+        let entry = meta.get(Path::new("/library/a.webp")).expect("cached entry");
+        assert_eq!(entry.rating, 5);
+        assert_eq!(entry.len, 4096);
+        assert_eq!(entry.modified, 1700000000);
+        std::fs::remove_dir_all(dir).ok();
+    }
+
+    #[test]
     fn rejects_stale_index_version() {
         let dir = std::env::temp_dir().join("symtropy-index-test-old");
         std::fs::create_dir_all(&dir).unwrap();
@@ -1356,6 +1514,46 @@ mod tests {
             "{}\t{}\t2\t0\t10\t20\t0\t0\t0\t0\t-\t-\t-\t-\t0\t-\t{{}}\n",
             path, mtime
         )
+    }
+
+    #[test]
+    fn recursive_index_items_only_returns_descendant_files() {
+        let dir = scratch("recursive-index");
+        let root = dir.join("folder");
+        std::fs::create_dir_all(root.join("deep")).unwrap();
+        let here = root.join("here.webp");
+        let deep = root.join("deep").join("deep.webp");
+        let outside = dir.join("outside.webp");
+        for path in [&here, &deep, &outside] {
+            std::fs::write(path, b"x").unwrap();
+        }
+        let row = |path: &Path, tags: &str| {
+            format!(
+                "{}\t1\t2\t0\t10\t20\t0\t0\t0\t0\t-\t-\t-\t-\t3\t{}\t{{}}\n",
+                path.display(), tags
+            )
+        };
+        let index_path = dir.join("index.tsv");
+        std::fs::write(
+            &index_path,
+            format!(
+                "#{}\n{}{}{}",
+                INDEX_VERSION,
+                row(&here, "keep"),
+                row(&deep, "fox|animal"),
+                row(&outside, "fox"),
+            ),
+        ).unwrap();
+
+        let existing = std::iter::once(here.to_string_lossy().into_owned()).collect();
+        let items = recursive_index_items(&index_path, &root, &existing);
+
+        assert_eq!(items.len(), 1, "only files below the folder should be returned");
+        assert_eq!(items[0].path, deep.to_string_lossy());
+        assert_eq!(items[0].rating, 3);
+        assert!(items[0].tags.contains("fox"));
+        assert!((items[0].aspect_ratio - 0.5).abs() < 0.001);
+        std::fs::remove_dir_all(dir).unwrap();
     }
 
     #[test]
@@ -1503,6 +1701,96 @@ mod tests {
 
         assert_eq!(image_dimensions(&path), Some((7, 5)));
 
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    fn ssvg_bytes() -> Vec<u8> {
+        let lossless = webp::Encoder::from_rgba(&[10, 20, 30, 255], 1, 1)
+            .encode_lossless()
+            .to_vec();
+        let mut package = ssvg::Package::new(
+            ssvg::Manifest {
+                canvas: ssvg::Canvas {
+                    width: 40,
+                    height: 30,
+                    ..ssvg::Canvas::default()
+                },
+                assets: vec![ssvg::Asset {
+                    path: "assets/a.webp".to_owned(),
+                    width: 1,
+                    height: 1,
+                    bytes: lossless.len() as u64,
+                }],
+                ..ssvg::Manifest::default()
+            },
+            ssvg::Scene {
+                layers: vec![ssvg::Node::layer("a", "A", "assets/a.webp")],
+                ..ssvg::Scene::default()
+            },
+            lossless.clone(),
+            lossless.clone(),
+        );
+        package.add_asset("assets/a.webp", lossless);
+        let mut out = Vec::new();
+        package
+            .write_to(std::io::Cursor::new(&mut out))
+            .expect("valid ssvg package");
+        out
+    }
+
+    fn write_ssvg(dir: &Path, name: &str) -> PathBuf {
+        let path = dir.join(name);
+        std::fs::write(&path, ssvg_bytes()).unwrap();
+        path
+    }
+
+    #[test]
+    fn ssvg_paths_are_recognised_case_insensitively() {
+        assert!(is_ssvg_path(Path::new("a.ssvg")));
+        assert!(is_ssvg_path(Path::new("A.SSVG")));
+        assert!(!is_ssvg_path(Path::new("a.webp")));
+    }
+
+    #[test]
+    fn ssvg_dimensions_come_from_the_manifest() {
+        let dir = scratch("ssvg-header");
+        let path = write_ssvg(&dir, "Composite.ssvg");
+        assert_eq!(ssvg_dimensions(&path), Some((40, 30)));
+
+        let bad = dir.join("bad.ssvg");
+        std::fs::write(&bad, b"not a package").unwrap();
+        assert_eq!(ssvg_dimensions(&bad), None);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn ssvg_preview_decodes_to_a_real_image() {
+        let dir = scratch("ssvg-decode");
+        let path = write_ssvg(&dir, "Composite.ssvg");
+        let preview = ssvg_preview(&path).expect("decodable preview");
+        assert_eq!((preview.width(), preview.height()), (1, 1));
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn content_dimensions_routes_ssvg_files_to_the_package_reader() {
+        let dir = scratch("ssvg-dims");
+        let path = write_ssvg(&dir, "Composite.SSVG");
+        assert_eq!(content_dimensions(&path), Some((40, 30)));
+        assert_eq!(image_dimensions(&path), None);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn make_thumb_decodes_ssvg_previews() {
+        let dir = scratch("ssvg-thumb");
+        let path = write_ssvg(&dir, "Composite.ssvg");
+        let thumb = make_thumb(&path.to_string_lossy(), [8, 8], None)
+            .expect("ssvg thumbnail");
+        match thumb {
+            WorkerThumbContent::Static(image) => assert_eq!(image.size, [8, 8]),
+            WorkerThumbContent::Animated { .. } => panic!("ssvg should be static"),
+        }
         std::fs::remove_dir_all(dir).unwrap();
     }
 }

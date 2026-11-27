@@ -129,9 +129,16 @@ fn cover(cell_px: [i32; 2], aspect: f32) -> ([u32; 2], Rect) {
 }
 
 impl GalleryState {
+    /// Draw the gallery inside one canonical viewport.
+    ///
+    /// A parent UI's `max_rect` can be enlarged by an overflowing toolbar row,
+    /// which previously made the mosaic use a width larger than the window. The
+    /// caller passes the visible rect; the whole gallery is confined to it.
     pub fn show(
         &mut self,
         ui: &mut Ui,
+        theme: &crate::theme::Theme,
+        viewport: Rect,
         dir: &Path,
         viewer_open: bool,
         dialog_open: bool,
@@ -148,13 +155,35 @@ impl GalleryState {
                 ui.add_space(8.0);
                 ui.label(
                     egui::RichText::new("Phase 1: reading headers & sidecars (fast)")
-                    .size(11.0)
-                    .color(Color32::from_rgb(140, 140, 150)),
+                        .size(11.0)
+                        .color(Color32::from_rgb(140, 140, 150)),
                 );
             });
             ui.ctx().request_repaint_after(Duration::from_millis(100));
             return;
         }
+
+        let viewport = viewport.intersect(ui.clip_rect());
+        if !viewport.is_positive() {
+            return;
+        }
+        ui.allocate_ui_at_rect(viewport, |ui| {
+            ui.set_clip_rect(viewport);
+            self.show_inner(ui, theme, viewport, dir, viewer_open, dialog_open, options, actions);
+        });
+    }
+
+    fn show_inner(
+        &mut self,
+        ui: &mut Ui,
+        theme: &crate::theme::Theme,
+        gallery_rect: Rect,
+        dir: &Path,
+        viewer_open: bool,
+        dialog_open: bool,
+        options: actions::MenuOptions,
+        actions: &mut Vec<Action>,
+    ) {
 
         let ctrl_down = ui.input(|i| i.modifiers.ctrl);
         let mut zoom_delta = 0.0;
@@ -182,25 +211,90 @@ impl GalleryState {
             self.grid_scale = (self.grid_scale + zoom_delta * 0.002).clamp(0.2, 5.0);
         }
 
-        let filtered: Vec<usize> = if matches!(self.active_query, Query::AlwaysTrue) {
-            (0..self.items.len()).collect()
-        } else {
-            self.items
-            .iter()
-            .enumerate()
-            .filter(|(_, item)| self.active_query.matches(&item.tags, item.rating, &self.hierarchy))
-            .map(|(i, _)| i)
-            .collect()
-        };
+        let filtered = self.filtered_indices().to_vec();
+
+        // Make the active scope impossible to miss. The toolbar filename search
+        // is always recursive; tag scope follows the visible toolbar toggle.
+        let mut gallery_rect = gallery_rect;
+        let tag_filter_active = !matches!(self.active_query, Query::AlwaysTrue);
+        let filename_filter_active = !self.filename_query.is_empty();
+        if tag_filter_active || filename_filter_active {
+            let banner_h = 28.0;
+            let banner_rect = Rect::from_min_max(
+                gallery_rect.min,
+                pos2(gallery_rect.max.x, gallery_rect.min.y + banner_h),
+            );
+            let scope = dir
+                .file_name()
+                .map(|name| name.to_string_lossy().to_string())
+                .unwrap_or_else(|| dir.display().to_string());
+            let tag_scope = if self.recursive_tag_search {
+                "folder + subfolders"
+            } else {
+                "folder only"
+            };
+            let criteria = match (filename_filter_active, tag_filter_active) {
+                (true, true) => format!(
+                    "filename '{}' (recursive) + {} ({})",
+                    self.filename_query, self.active_query, tag_scope
+                ),
+                (true, false) => format!("filename '{}' (recursive)", self.filename_query),
+                (false, true) => format!("{} ({})", self.active_query, tag_scope),
+                (false, false) => unreachable!(),
+            };
+            let claims = if tag_filter_active {
+                format!(
+                    " · confidence {} · claims {}",
+                    self.filter_confidence, self.filter_scope
+                )
+            } else {
+                String::new()
+            };
+            ui.painter().rect_filled(banner_rect, 4.0, Color32::from_black_alpha(210));
+            let mut banner_ui = ui.child_ui(
+                banner_rect.shrink(6.0),
+                egui::Layout::left_to_right(egui::Align::Center),
+            );
+            banner_ui.label(
+                egui::RichText::new(format!(
+                    "FILTER ACTIVE: {} · {}/{} in {}{}",
+                    criteria,
+                    filtered.len(),
+                    self.items.len(),
+                    scope,
+                    claims
+                ))
+                .size(12.0)
+                .color(Color32::WHITE),
+            );
+            banner_ui.separator();
+            if banner_ui.small_button("Clear").clicked() {
+                actions.push(Action::ClearFilters);
+            }
+            gallery_rect.min.y += banner_h + 4.0;
+        }
 
         let ppp = ui.ctx().pixels_per_point();
-        let available_width = ui.available_width();
+        let available_width = gallery_rect.width();
         let total_px = (available_width * ppp).round().max(1.0) as i32;
+        // The aspect-preserving mosaic is O(n), so it can use the exact clipped
+        // width. There is no bucket gutter and no stretch to hide it.
+        let layout_px = layout_bucket(total_px, LAYOUT_WIDTH_BUCKET);
         let m_px = (MARGIN * ppp).round().max(0.0) as i32;
         let h0_px = TARGET_ROW_HEIGHT * ppp * self.grid_scale;
-        let query_sig = self.active_query.to_string();
 
-        let key = (total_px, m_px, h0_px.round() as i32, filtered.len(), query_sig);
+        let layout_id = match self.layout {
+            GalleryLayout::Rows => 0u8,
+            GalleryLayout::Masonry => 1u8,
+        };
+        let key = (
+            layout_id,
+            layout_px,
+            m_px,
+            (h0_px.round() as i32) / LAYOUT_HEIGHT_BUCKET,
+            filtered.len(),
+            self.filter_generation,
+        );
         if self.layout_cache.as_ref().map(|c| &c.key) != Some(&key) {
             let items: Vec<layout::Item> = filtered
             .iter()
@@ -212,15 +306,15 @@ impl GalleryState {
                 }
             })
             .collect();
-            let (cells, total_h) = layout::compute(
-                &items,
-                &layout::Params { width: total_px, target_h: h0_px, margin: m_px },
-            );
+            let params = layout::Params { width: layout_px, target_h: h0_px, margin: m_px };
+            let (cells, total_h) = match self.layout {
+                GalleryLayout::Rows => layout::compute_rows(&items, &params),
+                GalleryLayout::Masonry => layout::compute(&items, &params),
+            };
             self.layout_cache = Some(LayoutCache { key, cells, total_h });
         }
         let cache = self.layout_cache.take().unwrap();
 
-        let gallery_rect = ui.available_rect_before_wrap();
         self.handle_keyboard_navigation(ui, &filtered, &cache, gallery_rect, dialog_open, viewer_open, actions);
 
         let mut filter_batch = crate::filter::FilterBatch::default();
@@ -235,6 +329,7 @@ impl GalleryState {
         let scroll = egui::ScrollArea::vertical()
         .drag_to_scroll(false)
         .vertical_scroll_offset(self.scroll_offset)
+        .auto_shrink([false, false])
         .scroll_bar_visibility(ScrollBarVisibility::AlwaysHidden)
         .show(ui, |ui| {
             // Lowest layer: right-clicking empty space gets a directory menu.
@@ -257,7 +352,7 @@ impl GalleryState {
 
             let origin = ui.cursor().min;
             let (ox, oy) = ((origin.x * ppp).round() as i32, (origin.y * ppp).round() as i32);
-            let visible = ui.clip_rect().expand(600.0);
+            let visible = ui.clip_rect().expand(80.0);
             let press_pos = ui.input(|i| i.pointer.press_origin().or_else(|| i.pointer.latest_pos()));
             let mut pointer_over_item = false;
             let ordered_paths: Vec<String> = filtered
@@ -275,7 +370,7 @@ impl GalleryState {
                         pointer_over_item = true;
                     }
                     let item_idx = filtered[cell_idx];
-                    self.draw_item(ui, item_idx, rect, [c.w, c.h], &mut filter_batch, viewer_open, options, &ordered_paths, actions);
+                    self.draw_item(ui, theme, item_idx, rect, [c.w, c.h], &mut filter_batch, viewer_open, options, &ordered_paths, actions);
                 }
             }
 
@@ -296,7 +391,7 @@ impl GalleryState {
         self.layout_cache = Some(cache);
         self.flush_requests();
 
-        self.filter_pass.paint(ui, filter_batch);
+        self.filter_pass.paint(ui, filter_batch, gallery_rect);
 
         if self.grid_scale != 1.0 || ctrl_down {
             let text = format!("Scale: {:.0}%", self.grid_scale * 100.0);
@@ -399,6 +494,7 @@ impl GalleryState {
     fn draw_item(
         &mut self,
         ui: &mut Ui,
+        theme: &crate::theme::Theme,
         item_idx: usize,
         rect: Rect,
         cell_px: [i32; 2],
@@ -498,7 +594,7 @@ impl GalleryState {
         if !has_image {
             let icon_name = if self.items[item_idx].is_folder { "folder".to_string() } else { self.items[item_idx].ext.clone() };
             let mut icon_drawn = false;
-            if let Some(bytes) = crate::theme::Theme::icon_bytes(&icon_name) {
+            if let Some(bytes) = theme.icon_bytes(&icon_name) {
                 if let Some(tex) = self.load_icon(ui.ctx(), &icon_name, bytes) {
                     let tex_size = tex.size_vec2();
                     let tex_aspect = tex_size.x / tex_size.y;

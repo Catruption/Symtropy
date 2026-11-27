@@ -1,5 +1,12 @@
 [workspace]
-members = ["crates/symtropy-ui"]
+members = [
+    "crates/symtropy-ui",
+    "crates/symtropy-agent",
+    "crates/ssvg",
+    "crates/symtropy-tags",
+    "crates/symtropy-sources",
+    "crates/symtropy-vision",
+]
 resolver = "2"
 
 [workspace.dependencies]
@@ -8,7 +15,6 @@ egui = "0.27"
 image = { version = "0.25", features = ["webp", "jpeg", "png", "gif"] }
 webp-animation = "0.9"
 alhazen-core = "0.5"
-x11rb = "0.13"
 rayon = "1.10"
 rusqlite = { version = "0.31", features = ["bundled"] }
 dirs = "5.0"
@@ -27,3 +33,7 @@ strip = "debuginfo"
 [profile.release]
 opt-level = 3
 strip = "symbols"
+
+[patch.crates-io]
+winit = { path = "vendor/winit" }
+eframe = { path = "vendor/eframe" }

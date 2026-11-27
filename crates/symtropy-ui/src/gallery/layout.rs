@@ -1,13 +1,18 @@
-//! Gap-free "mosaic" layout for the gallery.
+//! Aspect-preserving strip mosaic for the gallery.
 //!
-//! Images are packed into small slicing trees ("blocks" of up to MAX_BLOCK
-//! images). Every leaf keeps its exact aspect ratio, so nothing is cropped or
-//! padded. Instead of forcing cells, the search picks the tree whose leaf sizes
-//! best follow each image's size weight, and blocks are stacked down the page.
+//! Each strip is filled left-to-right with adjacent items. Strip height is
+//! derived from the items' aspect ratios, so a strip always fills the
+//! available width without scaling any image away from its own aspect ratio.
+//! Different strips get different heights, which keeps the masonry look while
+//! making a resize O(n) instead of a beam search.
 
-use std::cmp::Ordering;
+const MIN_ASPECT: f32 = 0.25;
+const MAX_ASPECT: f32 = 4.5;
+const SIZE_POWER: f32 = 0.12;
+const MIN_SIZE_SCALE: f32 = 0.8;
+const MAX_SIZE_SCALE: f32 = 1.25;
 
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Cell {
     pub x: i32,
     pub y: i32,
@@ -18,7 +23,8 @@ pub struct Cell {
 #[derive(Clone, Copy, Debug)]
 pub struct Item {
     pub aspect: f32,
-    /// Original pixel area. <= 1.0 means "unknown" (folders etc.) and gets weight 1.
+    /// Original pixel area. Used only to give large originals slightly taller
+    /// strips; never used to distort an image's aspect ratio.
     pub area: f32,
 }
 
@@ -28,285 +34,262 @@ pub struct Params {
     pub margin: i32,
 }
 
-// ---- tuning knobs -----------------------------------------------------------
-/// Largest group of images solved together as one tree. Cost grows quickly.
-const MAX_BLOCK: usize = 8;
-/// Candidate trees kept per image range.
-const BEAM: usize = 4;
-/// 0.0 = every image drawn the same size, 1.0 = drawn area proportional to
-/// original pixel area. In between keeps relative sizes without extremes.
-const SIZE_BIAS: f32 = 0.5;
-const W_MIN: f32 = 0.5;
-const W_MAX: f32 = 2.5;
-/// Penalty weight for leaves not matching their size weight inside a block.
-const SHAPE: f32 = 1.0;
-/// Penalty weight for a block's average size drifting from the target size.
-const SCALE: f32 = 0.6;
-/// Aspects beyond this are clamped for layout (the UI crops those few).
-const MIN_ASPECT: f32 = 0.25;
-const MAX_ASPECT: f32 = 4.5;
-// -----------------------------------------------------------------------------
-
-#[derive(Clone, Copy)]
-enum Kind {
-    Leaf(usize),
-    V,
-    H,
-}
-
-/// A slicing tree. Its width at height h is `a * h + b`.
-///
-/// `n`, `s1`, `s2` are statistics of ln(leaf_area / leaf_weight) when the block
-/// is rendered at height 1. They let us score a tree in O(1) when joining two
-/// subtrees, without walking it.
-#[derive(Clone)]
-struct Block {
-    kind: Kind,
-    kids: Vec<Block>,
-    a: f32,
-    b: f32,
-    n: f32,
-    s1: f32,
-    s2: f32,
-}
-
-struct Stats {
-    a: f32,
-    b: f32,
-    n: f32,
-    s1: f32,
-    s2: f32,
-}
-
-fn var_of(n: f32, s1: f32, s2: f32) -> f32 {
-    let mu = s1 / n;
-    (s2 / n - mu * mu).max(0.0)
-}
-
-/// Shift every ln(area) value by d: returns the new (s1, s2).
-fn shift(n: f32, s1: f32, s2: f32, d: f32) -> (f32, f32) {
-    (s1 + n * d, s2 + 2.0 * d * s1 + n * d * d)
-}
-
-fn leaf_block(i: usize, aspect: f32, weight: f32) -> Block {
-    // At height 1 the leaf is `aspect` wide, so its area is `aspect`.
-    let l = (aspect / weight).ln();
-    Block { kind: Kind::Leaf(i), kids: Vec::new(), a: aspect, b: 0.0, n: 1.0, s1: l, s2: l * l }
-}
-
-/// Stats of joining two blocks, without building the tree. `w` is the page
-/// width, used as the reference width when stacking vertically.
-fn join_stats(l: &Block, r: &Block, horiz: bool, m: f32, w: f32) -> Stats {
-    let n = l.n + r.n;
-    if horiz {
-        // Side by side: same height, so stats at height 1 just add.
-        Stats { a: l.a + r.a, b: l.b + r.b + m, n, s1: l.s1 + r.s1, s2: l.s2 + r.s2 }
+fn clamped_aspect(aspect: f32) -> f32 {
+    if aspect.is_finite() && aspect > 0.0 {
+        aspect.clamp(MIN_ASPECT, MAX_ASPECT)
     } else {
-        // Stacked: same width. Convert each child's stats from height 1 to the
-        // height it has at width w, add, then convert the whole to height 1.
-        let a = 1.0 / (1.0 / l.a + 1.0 / r.a);
-        let b = a * (l.b / l.a + r.b / r.a - m);
-        let hl = ((w - l.b) / l.a).max(1.0);
-        let hr = ((w - r.b) / r.a).max(1.0);
-        let hv = hl + hr + m;
-        let (l1, l2) = shift(l.n, l.s1, l.s2, 2.0 * hl.ln());
-        let (r1, r2) = shift(r.n, r.s1, r.s2, 2.0 * hr.ln());
-        let (s1, s2) = shift(n, l1 + r1, l2 + r2, -2.0 * hv.ln());
-        Stats { a, b, n, s1, s2 }
+        1.0
     }
 }
 
-fn join(l: &Block, r: &Block, horiz: bool, m: f32, w: f32) -> Block {
-    let s = join_stats(l, r, horiz, m, w);
-    Block {
-        kind: if horiz { Kind::H } else { Kind::V },
-        kids: vec![l.clone(), r.clone()],
-        a: s.a,
-        b: s.b,
-        n: s.n,
-        s1: s.s1,
-        s2: s.s2,
-    }
-}
+/// A mild per-image height preference. The exponent is deliberately small:
+/// big originals get more room, but not enough to break the mosaic rhythm.
+fn preferred_heights(items: &[Item], target_h: f32) -> Vec<f32> {
+    let mut known: Vec<f32> = items
+        .iter()
+        .map(|i| i.area)
+        .filter(|a| a.is_finite() && *a > 1.0)
+        .collect();
+    known.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+    let median = known.get(known.len() / 2).copied().unwrap_or(1.0);
 
-fn asp(items: &[Item], k: usize) -> f32 {
-    let a = items[k].aspect;
-    if a.is_finite() && a > 0.0 { a.clamp(MIN_ASPECT, MAX_ASPECT) } else { 1.0 }
-}
-
-fn weights(items: &[Item]) -> Vec<f32> {
-    let known = |a: f32| a.is_finite() && a > 1.0;
-    let mut areas: Vec<f32> = items.iter().map(|i| i.area).filter(|&a| known(a)).collect();
-    areas.sort_by(|a, b| a.partial_cmp(b).unwrap_or(Ordering::Equal));
-    let med = areas.get(areas.len() / 2).copied().unwrap_or(1.0);
     items
         .iter()
         .map(|i| {
-            if known(i.area) {
-                (i.area / med).powf(SIZE_BIAS).clamp(W_MIN, W_MAX)
+            if i.area.is_finite() && i.area > 1.0 {
+                let scale = (i.area / median)
+                    .powf(SIZE_POWER)
+                    .clamp(MIN_SIZE_SCALE, MAX_SIZE_SCALE);
+                target_h * scale
             } else {
-                1.0
+                target_h
             }
         })
         .collect()
 }
 
-/// table[lo][len - 1] = best few trees for items lo..lo+len.
-fn build_table(leaves: &[Block], m: f32, w: f32) -> Vec<Vec<Vec<Block>>> {
-    let n = leaves.len();
-    let mut t: Vec<Vec<Vec<Block>>> = leaves.iter().map(|l| vec![vec![l.clone()]]).collect();
-
-    for len in 2..=MAX_BLOCK {
-        for lo in 0..n {
-            if lo + len > n {
-                break;
-            }
-            // (score, split, horizontal, left idx, right idx)
-            let mut cands: Vec<(f32, usize, bool, usize, usize)> = Vec::new();
-            for k in 1..len {
-                let left = &t[lo][k - 1];
-                let right = &t[lo + k][len - k - 1];
-                for (ia, l) in left.iter().enumerate() {
-                    for (ib, r) in right.iter().enumerate() {
-                        for horiz in [true, false] {
-                            let s = join_stats(l, r, horiz, m, w);
-                            cands.push((var_of(s.n, s.s1, s.s2), k, horiz, ia, ib));
-                        }
-                    }
-                }
-            }
-            cands.sort_by(|x, y| x.0.partial_cmp(&y.0).unwrap_or(Ordering::Equal));
-            let best: Vec<Block> = cands
-                .iter()
-                .take(BEAM)
-                .map(|&(_, k, horiz, ia, ib)| {
-                    join(&t[lo][k - 1][ia], &t[lo + k][len - k - 1][ib], horiz, m, w)
-                })
-                .collect();
-            t[lo].push(best);
-        }
-    }
-    t
-}
-
-/// Cost of using `b` as a full-width block on a page `w` wide.
-fn block_cost(b: &Block, w: f32, ln_h0: f32, last: bool) -> f32 {
-    let hb = ((w - b.b) / b.a).max(1.0);
-    // mean of ln(area / weight) at the real size
-    let mean = b.s1 / b.n + 2.0 * hb.ln();
-    let mut off = mean - 2.0 * ln_h0;
-    // The final block may be shrunk instead of stretched to full width.
-    if last && off > 0.0 {
-        off = 0.0;
-    }
-    SHAPE * var_of(b.n, b.s1, b.s2) + SCALE * off * off
-}
-
-fn place(b: &Block, x: i32, y: i32, w: i32, h: i32, m: i32, out: &mut [Cell]) {
-    match b.kind {
-        Kind::Leaf(i) => out[i] = Cell { x, y, w: w.max(1), h: h.max(1) },
-        Kind::H => {
-            let k = b.kids.len();
-            let ws: Vec<f32> = b.kids.iter().map(|c| c.a * h as f32 + c.b).collect();
-            let total = ws.iter().sum::<f32>().max(1e-3);
-            let avail = (w - (k as i32 - 1) * m).max(k as i32);
-            let f = avail as f32 / total;
-            let mut cum = 0.0f32;
-            for (idx, c) in b.kids.iter().enumerate() {
-                let wf = ws[idx] * f;
-                let left = cum.round() as i32;
-                let right = if idx + 1 == k { avail } else { (cum + wf).round() as i32 };
-                place(c, x + left + idx as i32 * m, y, (right - left).max(1), h, m, out);
-                cum += wf;
-            }
-        }
-        Kind::V => {
-            let k = b.kids.len();
-            let hs: Vec<f32> = b.kids.iter().map(|c| (w as f32 - c.b) / c.a).collect();
-            let total = hs.iter().sum::<f32>().max(1e-3);
-            let avail = (h - (k as i32 - 1) * m).max(k as i32);
-            let f = avail as f32 / total;
-            let mut cum = 0.0f32;
-            for (idx, c) in b.kids.iter().enumerate() {
-                let hf = hs[idx] * f;
-                let top = cum.round() as i32;
-                let bottom = if idx + 1 == k { avail } else { (cum + hf).round() as i32 };
-                place(c, x, y + top + idx as i32 * m, w, (bottom - top).max(1), m, out);
-                cum += hf;
-            }
-        }
-    }
-}
-
 pub fn compute(items: &[Item], p: &Params) -> (Vec<Cell>, i32) {
-    let m = p.margin.max(0);
+    let margin = p.margin.max(0);
     let n = items.len();
     if n == 0 {
-        return (Vec::new(), m);
+        return (Vec::new(), margin);
     }
-    let mf = m as f32;
-    let w_inner = (p.width - 2 * m).max(1) as f32;
-    let ln_h0 = p.target_h.max(1.0).ln();
 
-    let wt = weights(items);
-    let leaves: Vec<Block> = (0..n).map(|i| leaf_block(i, asp(items, i), wt[i])).collect();
-    let table = build_table(&leaves, mf, w_inner);
+    let inner_w = (p.width - 2 * margin).max(1);
+    let aspects: Vec<f32> = items.iter().map(|i| clamped_aspect(i.aspect)).collect();
+    let preferred = preferred_heights(items, p.target_h.max(1.0));
 
-    // Cut the item list into blocks (DP over block boundaries).
-    let mut best = vec![f32::INFINITY; n + 1];
-    let mut prev = vec![(0usize, 0usize); n + 1]; // (block start, beam index)
-    best[0] = 0.0;
-    for q in 1..=n {
-        for len in 1..=MAX_BLOCK.min(q) {
-            let p0 = q - len;
-            if !best[p0].is_finite() {
-                continue;
+    let mut cells = vec![Cell { x: margin, y: margin, w: 1, h: 1 }; n];
+    let mut top = margin;
+    let mut lo = 0;
+
+    while lo < n {
+        // Start a strip with one item. Its ideal height is width / aspect.
+        let mut sum_a = aspects[lo];
+        let mut target_sum = sum_a * preferred[lo];
+        let mut count = 1usize;
+        let mut height = inner_w as f32 / sum_a;
+        let mut target = target_sum / sum_a;
+
+        // Add neighbors while the strip height moves closer to the average
+        // preferred height. Widths stay proportional to each item's aspect,
+        // so every leaf keeps its own shape.
+        while lo + count < n {
+            let next_a = aspects[lo + count];
+            if count + 1 > inner_w as usize {
+                break;
             }
-            for (bi, blk) in table[p0][len - 1].iter().enumerate() {
-                // weight by item count so big blocks aren't favoured or punished
-                let c = block_cost(blk, w_inner, ln_h0, q == n) * blk.n;
-                if best[p0] + c < best[q] {
-                    best[q] = best[p0] + c;
-                    prev[q] = (p0, bi);
-                }
-            }
-        }
-        if !best[q].is_finite() {
-            best[q] = best[q - 1] + 1.0e3;
-            prev[q] = (q - 1, 0);
-        }
-    }
+            let avail = (inner_w - margin * count as i32).max(1) as f32;
+            let next_sum = sum_a + next_a;
+            let next_target = (target_sum + next_a * preferred[lo + count]) / next_sum;
+            let next_height = avail / next_sum;
 
-    let mut blocks: Vec<(usize, usize, usize)> = Vec::new();
-    let mut q = n;
-    while q > 0 {
-        let (p0, bi) = prev[q];
-        blocks.push((p0, q, bi));
-        q = p0;
-    }
-    blocks.reverse();
-
-    let mut out = vec![Cell { x: 0, y: 0, w: 1, h: 1 }; n];
-    let mut y = m;
-    for (p0, q, bi) in blocks {
-        let blk = &table[p0][q - p0 - 1][bi];
-        let mut wb = w_inner;
-        let mut hb = ((wb - blk.b) / blk.a).max(1.0);
-
-        if q == n {
-            // Last block: if full width would blow it up past target size,
-            // draw it at target size and leave the right side empty.
-            let mean = blk.s1 / blk.n + 2.0 * hb.ln();
-            if mean > 2.0 * ln_h0 {
-                hb = (ln_h0 - blk.s1 / (2.0 * blk.n)).exp().max(1.0);
-                wb = blk.a * hb + blk.b;
+            if (next_height - next_target).abs() <= (height - target).abs() {
+                sum_a = next_sum;
+                target_sum += next_a * preferred[lo + count];
+                count += 1;
+                height = next_height;
+                target = next_target;
+            } else {
+                break;
             }
         }
 
-        let wi = (wb.round() as i32).max(1);
-        let hi = (hb.round() as i32).max(1);
-        place(blk, m, y, wi, hi, m, &mut out);
-        y += hi + m;
+        let gap = margin * count.saturating_sub(1) as i32;
+        let avail = (inner_w - gap).max(1);
+        let h_px = height.round().max(1.0) as i32;
+
+        let mut x = margin;
+        let mut acc = 0.0f32;
+        for j in 0..count {
+            acc += aspects[lo + j];
+            let next_x = margin + ((acc / sum_a) * avail as f32).round() as i32;
+            let next_x = next_x.clamp(x + 1, margin + avail);
+            cells[lo + j] = Cell {
+                x,
+                y: top,
+                w: next_x - x,
+                h: h_px,
+            };
+            x = next_x;
+        }
+
+        lo += count;
+        top += h_px;
+        if lo < n {
+            top += margin;
+        }
     }
-    (out, y)
+
+    (cells, top + margin)
+}
+
+/// Uniform-height rows, wrapping when the next thumbnail would overflow.
+///
+/// This is the Gallery mode: predictable density and O(n) layout. Aspect
+/// ratios stay visible through clipping in the painter, so no image is
+/// stretched to fill a cell.
+pub fn compute_rows(items: &[Item], p: &Params) -> (Vec<Cell>, i32) {
+    let margin = p.margin.max(0);
+    let inner_w = (p.width - 2 * margin).max(1);
+    if items.is_empty() {
+        return (Vec::new(), margin);
+    }
+
+    let row_h = p.target_h.max(1.0).round().max(1.0) as i32;
+    let mut cells = vec![Cell { x: margin, y: margin, w: 1, h: row_h }; items.len()];
+    let mut x = margin;
+    let mut y = margin;
+
+    for (index, item) in items.iter().enumerate() {
+        let aspect = clamped_aspect(item.aspect);
+        let wanted = (row_h as f32 * aspect).round().max(1.0) as i32;
+        let w = wanted.min(inner_w);
+        if x > margin && x + w > margin + inner_w {
+            y += row_h + margin;
+            x = margin;
+        }
+        cells[index] = Cell { x, y, w, h: row_h };
+        x += w + margin;
+    }
+
+    (cells, y + row_h + margin)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn item(aspect: f32, area: f32) -> Item {
+        Item { aspect, area }
+    }
+
+    #[test]
+    fn empty_layout_has_no_cells() {
+        let (cells, h) = compute(&[], &Params { width: 800, target_h: 200.0, margin: 0 });
+        assert!(cells.is_empty());
+        assert_eq!(h, 0);
+    }
+
+    #[test]
+    fn cells_stay_inside_the_viewport() {
+        let items: Vec<_> = (0..64)
+            .map(|i| item(0.5 + (i % 7) as f32 * 0.3, 1000.0 * (i as f32 + 1.0)))
+            .collect();
+        let p = Params { width: 640, target_h: 120.0, margin: 4 };
+        let (cells, h) = compute(&items, &p);
+        assert_eq!(cells.len(), items.len());
+        assert!(h > 0);
+        for c in &cells {
+            assert!(c.x >= p.margin);
+            assert!(c.x + c.w <= p.width - p.margin);
+            assert!(c.y >= p.margin);
+            assert!(c.w >= 1 && c.h >= 1);
+        }
+    }
+
+    #[test]
+    fn cells_do_not_overlap() {
+        let items = vec![
+            item(1.0, 100.0), item(0.7, 400.0), item(1.8, 900.0),
+            item(1.2, 1600.0), item(0.9, 2500.0), item(1.5, 3600.0),
+        ];
+        let (cells, _) = compute(&items, &Params { width: 600, target_h: 150.0, margin: 0 });
+        for (i, a) in cells.iter().enumerate() {
+            for b in cells.iter().skip(i + 1) {
+                let overlap = a.x < b.x + b.w && b.x < a.x + a.w
+                    && a.y < b.y + b.h && b.y < a.y + a.h;
+                assert!(!overlap, "cells {} and {} overlap", i, i + 1 + cells.iter().position(|c| c == b).unwrap_or(0));
+            }
+        }
+    }
+
+    #[test]
+    fn uniform_items_stay_near_the_target_height() {
+        let items = vec![item(1.0, 100.0); 24];
+        let (cells, _) = compute(&items, &Params { width: 800, target_h: 100.0, margin: 0 });
+        for c in &cells {
+            assert!((c.h as f32 - 100.0).abs() <= 25.0);
+        }
+    }
+
+    #[test]
+    fn strips_keep_each_images_aspect_ratio() {
+        let aspects = [0.5f32, 1.0, 1.5, 2.0, 0.8, 1.25];
+        let items: Vec<_> = (0..48)
+            .map(|i| item(aspects[i % aspects.len()], 1000.0))
+            .collect();
+        let (cells, _) = compute(&items, &Params { width: 1200, target_h: 120.0, margin: 0 });
+        for (cell, item) in cells.iter().zip(&items) {
+            let actual = cell.w as f32 / cell.h as f32;
+            let expected = clamped_aspect(item.aspect);
+            assert!(
+                (actual / expected - 1.0).abs() < 0.12,
+                "cell aspect {:.3}, expected {:.3}",
+                actual,
+                expected
+            );
+        }
+    }
+
+    #[test]
+    fn mixed_aspects_make_more_than_one_strip_height() {
+        let items = vec![
+            item(0.5, 100.0), item(0.5, 100.0), item(0.5, 100.0),
+            item(3.0, 100.0), item(3.0, 100.0),
+            item(1.0, 100.0), item(1.0, 100.0), item(1.0, 100.0),
+        ];
+        let (cells, _) = compute(&items, &Params { width: 900, target_h: 150.0, margin: 0 });
+        let heights: std::collections::HashSet<i32> = cells.iter().map(|c| c.h).collect();
+        assert!(heights.len() > 1, "all strips had the same height");
+    }
+
+    #[test]
+    fn rows_wrap_and_keep_a_uniform_height() {
+        let items = vec![item(1.0, 100.0); 10];
+        let p = Params { width: 450, target_h: 100.0, margin: 0 };
+        let (cells, total_h) = compute_rows(&items, &p);
+        assert_eq!(cells.len(), items.len());
+        assert!(cells.iter().all(|c| c.h == 100));
+        assert!(cells.iter().any(|c| c.y > 0), "rows did not wrap");
+        assert!(total_h >= 200);
+        for c in &cells {
+            assert!(c.x >= 0 && c.x + c.w <= p.width);
+        }
+    }
+
+    #[test]
+    fn rows_do_not_overlap() {
+        let items: Vec<_> = (0..40)
+            .map(|i| item(0.6 + (i % 5) as f32 * 0.4, 1000.0))
+            .collect();
+        let (cells, _) = compute_rows(&items, &Params { width: 640, target_h: 120.0, margin: 4 });
+        for (i, a) in cells.iter().enumerate() {
+            for b in cells.iter().skip(i + 1) {
+                let overlap = a.x < b.x + b.w && b.x < a.x + a.w
+                    && a.y < b.y + b.h && b.y < a.y + a.h;
+                assert!(!overlap, "row cells {} and {} overlap", i, i + 1);
+            }
+        }
+    }
 }

@@ -1,15 +1,24 @@
 use crate::actions::{self, Action, ClipboardMode, ContextTarget, MenuOptions, TagDialog};
 use crate::theme::Theme;
-use crate::x11::X11Window;
-use crate::gallery::{GalleryState, frame_from_time, Sidecar};
+use crate::gallery::{
+    ClaimScope, ClaimSource, ConfidenceRange, GalleryLayout, GalleryState, Sidecar, TagEvidence,
+    frame_from_time,
+};
+use crate::query_agent::QueryPlanner;
 use crate::sidebar::FilterQuery;
+use crate::source_search::{self, ReviewOutcome, SourceWorkerMsg};
+use crate::tag_review::{ReviewUiState, TagReviewStore};
+use crate::tag_manager::{self, AiSearchApply, TagManagerState};
 use crate::file_manager::{self, FileManagerState, SortDirection, ViewMode};
+use crate::local_vision::{self, LocalVisionWorkerMsg, OnnxUiConfig};
 use std::collections::{HashMap, HashSet};
 use std::io::{Read as _, Seek as _};
 use std::path::{Path, PathBuf};
-use std::time::{Duration, Instant, UNIX_EPOCH};
+use std::sync::mpsc::{Receiver, TryRecvError};
+use std::time::{Duration, UNIX_EPOCH};
 
 use alhazen_core::{Player, PlayerConfig, PlayerState, Source, VideoFrame, PlayerEvent};
+use symtropy_tags::AssertionState;
 
 // ---------------------------------------------------------------------------
 // Persistent state — remembers folder, view mode, sidebar, hidden toggle
@@ -36,11 +45,9 @@ struct FolderViewMemory {
     gallery_scroll_offset: Option<f32>,
 }
 
-struct SlideshowState {
-    paths: Vec<String>,
-    idx: usize,
-    next_at: std::time::Instant,
-    interval: std::time::Duration,
+struct PendingAiApply {
+    token: u64,
+    fallback: AiSearchApply,
 }
 
 #[derive(serde::Serialize, serde::Deserialize, Default)]
@@ -61,6 +68,7 @@ struct SavedState {
     button_scale: Option<f32>,
     recent_dirs: Vec<PathBuf>,
     folder_views: HashMap<String, FolderViewMemory>,
+    onnx_vision: Option<OnnxUiConfig>,
 }
 
 fn fnv1a(bytes: &[u8], seed: u64) -> u64 {
@@ -199,6 +207,7 @@ fn sort_view_mode(mode: &ViewMode) -> &'static str {
     match mode {
         ViewMode::List => "list",
         ViewMode::Gallery => "gallery",
+        ViewMode::Masonry => "masonry",
     }
 }
 
@@ -234,7 +243,15 @@ fn parse_view_mode(name: Option<&str>) -> Option<ViewMode> {
     match name.unwrap_or("").to_ascii_lowercase().as_str() {
         "list" => Some(ViewMode::List),
         "gallery" => Some(ViewMode::Gallery),
+        "masonry" => Some(ViewMode::Masonry),
         _ => None,
+    }
+}
+
+fn gallery_layout(mode: &ViewMode) -> GalleryLayout {
+    match mode {
+        ViewMode::Masonry => GalleryLayout::Masonry,
+        _ => GalleryLayout::Rows,
     }
 }
 
@@ -340,6 +357,7 @@ enum Dialog {
     EditTag { paths: Vec<PathBuf>, remove: bool, text: String },
     Tag { kind: TagDialog, text: String },
     Duplicates { groups: Vec<Vec<PathBuf>> },
+    ExportMetadata { path: String },
 }
 
 fn dedup_tags(tags: Vec<String>) -> Vec<String> {
@@ -420,11 +438,35 @@ fn remap_subtree_in_sidecar(
     before_tags != sc.tags || before_links != sc.tag_parents
 }
 
+/// Sidecar edits are staged per full image path. The viewer and the Tag
+/// Manager can target different files at the same time; a single unkeyed copy
+/// would make one window display (and potentially save) the other window's tags.
+#[derive(Default)]
+struct StagedSidecars {
+    entries: HashMap<String, Sidecar>,
+}
+
+impl StagedSidecars {
+    fn get(&self, item_id: &str) -> Option<&Sidecar> {
+        self.entries.get(item_id)
+    }
+
+    fn take(&mut self, item_id: &str) -> Option<Sidecar> {
+        self.entries.remove(item_id)
+    }
+
+    fn insert(&mut self, item_id: impl Into<String>, sidecar: Sidecar) {
+        self.entries.insert(item_id.into(), sidecar);
+    }
+
+    fn values_mut(&mut self) -> impl Iterator<Item = &mut Sidecar> {
+        self.entries.values_mut()
+    }
+}
+
 pub struct SymtropyApp {
     theme: Theme,
     frames: u32,
-    x11: Option<X11Window>,
-    last_overhang_px: u32,
     last_persisted_frame_scale: f32,
     last_persisted_button_scale: f32,
 
@@ -449,8 +491,18 @@ pub struct SymtropyApp {
     video_loop: bool,
 
     is_edit_mode: bool,
-    staged_sidecar: Option<Sidecar>,
+    tag_manager: TagManagerState,
+    query_planner: QueryPlanner,
+    pending_ai_apply: Option<PendingAiApply>,
+    tag_review: TagReviewStore,
+    review_ui: ReviewUiState,
+    source_rx: Option<Receiver<SourceWorkerMsg>>,
+    local_vision_rx: Option<Receiver<LocalVisionWorkerMsg>>,
+    staged_sidecars: StagedSidecars,
     filter_query: FilterQuery,
+    /// Toolbar visibility toggle for tag-filter scope. Not persisted: filters
+    /// reset on navigation, and the default is always the current folder.
+    recursive_tag_search: bool,
     path_bar: crate::pathbar::PathBarState,
     show_places: bool,
 
@@ -460,12 +512,54 @@ pub struct SymtropyApp {
     redo_stack: Vec<UndoOp>,
     recent_dirs: Vec<PathBuf>,
     folder_views: HashMap<String, FolderViewMemory>,
-    slideshow: Option<SlideshowState>,
     dialog: Option<Dialog>,
     status: Option<String>,
 }
 
 impl SymtropyApp {
+    /// Build the effective tag confidences used by the gallery filter. Sidecar
+    /// tags are accepted claims; the review store adds accepted decisions and
+    /// suggestions below 100%. Rejected and superseded claims are ignored.
+    fn build_filter_evidence(&self, review: &TagReviewStore) -> HashMap<String, TagEvidence> {
+        let Some(gallery) = &self.gallery else {
+            return HashMap::new();
+        };
+        gallery
+            .items
+            .iter()
+            .map(|item| {
+                let mut evidence =
+                    TagEvidence::from_tags(item.tags.iter().map(String::as_str)).with_item_id(&item.path);
+                for relation in review.store.global_relations() {
+                    evidence.insert_relation(relation.clone(), true);
+                }
+                if let Some(tags) = review.store.item(&item.path) {
+                    for assertion in &tags.assertions {
+                        if item.sidecar.is_preserved_tag(&assertion.tag) {
+                            continue;
+                        }
+                        let source = ClaimSource::from_provenance(assertion.provenance.kind);
+                        match assertion.state {
+                            AssertionState::Accepted => {
+                                evidence.insert_accepted_with_source(&assertion.tag, source)
+                            }
+                            AssertionState::Suggested => evidence.insert_suggested_with_source(
+                                &assertion.tag,
+                                assertion.confidence,
+                                source,
+                            ),
+                            AssertionState::Rejected | AssertionState::Superseded => {}
+                        }
+                    }
+                    for relation in &tags.relations {
+                        evidence.insert_relation(relation.clone(), false);
+                    }
+                }
+                (item.path.clone(), evidence)
+            })
+            .collect()
+    }
+
     pub fn new(
         cc: &eframe::CreationContext<'_>,
         default_library: PathBuf,
@@ -481,6 +575,7 @@ impl SymtropyApp {
 
         // Explicit argument/env > remembered directory > runtime-resolved default.
         let saved = SavedState::load();
+        let filter_query = FilterQuery::default();
         let initial_dir = explicit_library
         .filter(|p| p.is_dir())
         .or_else(|| saved.current_dir.clone().filter(|p| p.exists()))
@@ -507,7 +602,7 @@ impl SymtropyApp {
             }
         }
 
-        let mut gallery = if fm.view_mode == ViewMode::Gallery {
+        let mut gallery = if fm.view_mode.is_gallery() {
             Some(GalleryState::scan_dir(&cc.egui_ctx, &fm.current_dir))
         } else {
             None
@@ -517,6 +612,7 @@ impl SymtropyApp {
             if let Some(offset) = view.gallery_scroll_offset { g.scroll_offset = offset; }
         }
         if let Some(g) = gallery.as_mut() {
+            g.set_layout(gallery_layout(&fm.view_mode));
             g.set_sort(fm.sort, fm.sort_direction);
         }
 
@@ -528,7 +624,7 @@ impl SymtropyApp {
 
         let mut app = Self {
             theme,
-            frames: 0, x11: None, last_overhang_px: 0,
+            frames: 0,
             last_persisted_frame_scale: frame_scale, last_persisted_button_scale: button_scale,
             fm, gallery,
             viewer_open: false, viewer_cache: HashMap::new(), viewer_player: None,
@@ -541,14 +637,24 @@ impl SymtropyApp {
             video_muted: saved.video_muted.unwrap_or(false),
             video_loop: saved.video_loop.unwrap_or(false),
             is_edit_mode: saved.sidebar_edit_mode.unwrap_or(false),
-            staged_sidecar: None, filter_query: FilterQuery::default(),
+            tag_manager: TagManagerState::default(),
+            query_planner: QueryPlanner::default(),
+            pending_ai_apply: None,
+            tag_review: TagReviewStore::load(),
+            review_ui: ReviewUiState {
+                onnx: saved.onnx_vision.unwrap_or_default(),
+                ..ReviewUiState::default()
+            },
+            source_rx: None,
+            local_vision_rx: None,
+            staged_sidecars: StagedSidecars::default(), filter_query,
+            recursive_tag_search: false,
             path_bar: crate::pathbar::PathBarState::default(),
             show_places: saved.show_places.unwrap_or(true),
             clipboard: Vec::new(), clipboard_mode: ClipboardMode::Copy,
             undo_stack: Vec::new(), redo_stack: Vec::new(),
             recent_dirs: saved.recent_dirs.into_iter().filter(|p| p.is_dir()).take(20).collect(),
             folder_views: saved.folder_views,
-            slideshow: None,
             dialog: None, status: None,
         };
         let current = app.fm.current_dir.clone();
@@ -566,6 +672,393 @@ impl SymtropyApp {
         self.status = Some(message.into());
     }
 
+    /// Persist the staged sidecar after an explicit source import. The import
+    /// button is the user decision; this only stores its provenance result.
+    fn persist_staged_sidecar(&mut self, item_id: &str) -> bool {
+        let Some(sidecar) = self.staged_sidecars.get(item_id).cloned() else { return false };
+        let index_path = crate::gallery::workers::cache_dir().join("index.tsv");
+        let mut found = false;
+        if let Some(g) = &mut self.gallery {
+            if let Some(item) = g.items.iter_mut().find(|item| item.path == item_id) {
+                item.sidecar = sidecar.clone();
+                item.tags = sidecar.active_tags().into_iter().collect();
+                item.rating = sidecar.rating;
+                let _ = item.sidecar.save(Path::new(&item.path));
+                crate::gallery::workers::update_index_entry(&index_path, &item.path, &item.sidecar);
+                found = true;
+            }
+            g.rebuild_tag_tree();
+        }
+        found
+    }
+
+    /// Paths offered by the native Tag Manager target picker. Selection comes
+    /// first so a right-click review targets the image the user actually chose.
+    fn tag_manager_targets(&self) -> Vec<String> {
+        let mut out = Vec::new();
+        let mut seen = HashSet::new();
+        let mut push = |path: &Path| {
+            let value = path.to_string_lossy().into_owned();
+            if !value.is_empty() && seen.insert(value.clone()) {
+                out.push(value);
+            }
+        };
+        for path in self.selected_paths() {
+            if !path.is_dir() {
+                push(&path);
+            }
+        }
+        if let Some(gallery) = &self.gallery {
+            for item in &gallery.items {
+                push(Path::new(&item.path));
+            }
+        } else {
+            for entry in &self.fm.entries {
+                if !entry.is_dir {
+                    push(&entry.path);
+                }
+            }
+        }
+        out
+    }
+
+    /// Stage an image's sidecar exactly once, keyed by its full path. Existing
+    /// edits stay in place; a new path is loaded and imported into the review
+    /// store without touching any other staged image.
+    fn ensure_staged_sidecar(&mut self, item_id: &str) -> Sidecar {
+        if let Some(sidecar) = self.staged_sidecars.get(item_id) {
+            return sidecar.clone();
+        }
+        let sidecar = self.sidecar_for_path(Path::new(item_id));
+        self.staged_sidecars.insert(item_id.to_string(), sidecar.clone());
+        let _ = self.tag_review.import_sidecar(item_id, &sidecar);
+        let _ = self.tag_review.capture_sidecar_sources(item_id, &sidecar);
+        sidecar
+    }
+
+    /// Temporarily remove one image's staged sidecar for a viewport draw. The
+    /// caller must put it back under the same path when the draw finishes.
+    fn take_staged_sidecar(&mut self, item_id: &str) -> Option<Sidecar> {
+        let _ = self.ensure_staged_sidecar(item_id);
+        self.staged_sidecars.take(item_id)
+    }
+
+    fn open_tag_manager(&mut self, target: Option<PathBuf>) {
+        // Build the 30k-path picker once per open instead of once per frame.
+        let targets = self.tag_manager_targets();
+        self.tag_manager.targets.set_paths(targets);
+        let target = target
+            .or_else(|| self.selected_paths().into_iter().find(|path| !path.is_dir()))
+            .or_else(|| self.viewer_loaded_path.as_ref().map(PathBuf::from))
+            .or_else(|| {
+                self.gallery.as_ref().and_then(|g| {
+                    g.items
+                        .iter()
+                        .find(|item| !item.sidecar.tags.is_empty())
+                        .or_else(|| g.items.first())
+                        .map(|item| PathBuf::from(&item.path))
+                })
+            })
+            .map(|path| path.to_string_lossy().into_owned());
+        if let Some(target) = target {
+            if self.tag_manager.item.as_deref() != Some(target.as_str()) {
+                let _ = self.ensure_staged_sidecar(&target);
+                self.tag_manager.item = Some(target.clone());
+            }
+        }
+        self.tag_manager.open = true;
+    }
+
+    fn toggle_tag_manager(&mut self) {
+        if self.tag_manager.open {
+            self.tag_manager.open = false;
+        } else {
+            self.open_tag_manager(None);
+        }
+    }
+
+    /// Apply the review window's deferred effects: sidecar writes and worker
+    /// launches. The manager itself never starts a worker or writes a sidecar.
+    fn apply_review_outcome(
+        &mut self,
+        ctx: &egui::Context,
+        item_id: &str,
+        outcome: ReviewOutcome,
+        staged_sidecar: Option<Sidecar>,
+    ) {
+        if outcome.synced || outcome.preservation_changed || outcome.source_attached {
+            if let Some(sidecar) = staged_sidecar {
+                let index_path = crate::gallery::workers::cache_dir().join("index.tsv");
+                if let Some(gallery) = &mut self.gallery {
+                    if let Some(item) = gallery.items.iter_mut().find(|item| item.path == item_id) {
+                        item.sidecar = sidecar.clone();
+                        item.tags = sidecar.active_tags().into_iter().collect();
+                        item.rating = sidecar.rating;
+                        let _ = item.sidecar.save(Path::new(&item.path));
+                        crate::gallery::workers::update_index_entry(&index_path, &item.path, &item.sidecar);
+                    }
+                    gallery.rebuild_tag_tree();
+                }
+                self.sync_tag_revision_to_gallery();
+            }
+            if outcome.source_attached {
+                self.set_status("Source attachment saved to sidecar");
+            } else if outcome.preservation_changed {
+                self.set_status("Preserved tags updated in sidecar");
+            } else {
+                self.set_status("Accepted tag claims synced to sidecar");
+            }
+        }
+
+        if let Some(job) = outcome.source_search {
+            if self.source_rx.is_none() {
+                self.source_rx = Some(source_search::spawn_source_search(ctx, job));
+            } else {
+                self.review_ui.source_busy = false;
+                self.set_status("Another source task is already running");
+            }
+        }
+        if let Some(job) = outcome.source_import {
+            if self.source_rx.is_none() {
+                self.source_rx = Some(source_search::spawn_source_import(ctx, job));
+            } else {
+                self.review_ui.source_busy = false;
+                self.set_status("Another source task is already running");
+            }
+        }
+        if let Some(job) = outcome.local_vision {
+            if self.local_vision_rx.is_none() {
+                self.local_vision_rx = Some(local_vision::spawn_local_vision(ctx, job));
+            } else {
+                self.set_status("Another local vision task is already running");
+            }
+        }
+    }
+
+    /// One gallery cache invalidation path for every tag-store writer (review
+    /// window, worker result, or import), instead of viewer-local copies.
+    fn sync_tag_revision_to_gallery(&mut self) {
+        let revision = self.tag_review.store.revision();
+        if self.gallery.as_ref().is_some_and(|gallery| gallery.filter_revision == revision) {
+            return;
+        }
+        let evidence = self.build_filter_evidence(&self.tag_review);
+        if let Some(gallery) = &mut self.gallery {
+            gallery.filter_evidence = evidence;
+            gallery.invalidate_filter_cache();
+            gallery.filter_revision = revision;
+        }
+    }
+
+    /// Materialize descendant items only while a tag filter and the visible
+    /// recursive toggle are both active. Rows come from the global index, so
+    /// this never reads or writes sidecars.
+    fn sync_recursive_tag_search(&mut self) {
+        let Some(gallery) = self.gallery.as_mut() else { return };
+        if gallery.recursive_tag_search != self.recursive_tag_search {
+            gallery.recursive_tag_search = self.recursive_tag_search;
+            gallery.clear_recursive_items();
+        }
+        let wants_descendants = gallery.recursive_tag_search
+            && !matches!(gallery.active_query, crate::gallery::Query::AlwaysTrue);
+        if !wants_descendants {
+            gallery.clear_recursive_items();
+            return;
+        }
+        let root = self.fm.current_dir.clone();
+        if gallery.recursive_root.as_deref() == Some(root.as_path()) {
+            return;
+        }
+        let existing: std::collections::HashSet<String> = gallery
+            .items
+            .iter()
+            .map(|item| item.path.clone())
+            .collect();
+        let extras = crate::gallery::workers::recursive_index_items(
+            &crate::paths::cache_dir().join("index.tsv"),
+            &root,
+            &existing,
+        );
+        gallery.add_recursive_items(root, extras);
+        let evidence = self.build_filter_evidence(&self.tag_review);
+        if let Some(gallery) = &mut self.gallery {
+            gallery.filter_evidence = evidence;
+            gallery.invalidate_filter_cache();
+        }
+    }
+
+    /// Poll the at-most-one source worker. This runs before the viewer takes
+    /// its local metadata snapshot, so results cannot be overwritten by it.
+    fn poll_source_workers(&mut self, ctx: &egui::Context) {
+        let Some(rx) = self.source_rx.take() else { return };
+        match rx.try_recv() {
+            Ok(SourceWorkerMsg::Search { item_id, result }) => {
+                match result {
+                    Ok(report) => {
+                        let summary = format!(
+                            "source match found {} candidate(s) for {}",
+                            report.candidates.len(), item_id
+                        );
+                        source_search::apply_search_result(
+                            &mut self.review_ui,
+                            &item_id,
+                            report,
+                        );
+                        self.set_status(summary);
+                    }
+                    Err(error) => {
+                        self.review_ui.source_busy = false;
+                        self.review_ui.source_status = format!("Search failed: {error}");
+                        self.set_status(format!("Source search failed: {error}"));
+                    }
+                }
+                ctx.request_repaint();
+            }
+            Ok(SourceWorkerMsg::Import { item_id, item, result }) => {
+                let active_target = self.viewer_loaded_path.as_deref() == Some(item_id.as_str())
+                    || self.tag_manager.item.as_deref() == Some(item_id.as_str());
+                if active_target {
+                    let staged = self.staged_sidecars.get(&item_id).cloned()
+                        .unwrap_or_else(|| self.sidecar_for_path(Path::new(&item_id)));
+                    let mut staged = Some(staged);
+                    let cached = source_search::apply_import_result(
+                        &mut self.review_ui,
+                        &mut staged,
+                        &item,
+                        result,
+                    );
+                    if let Some(sidecar) = staged {
+                        self.staged_sidecars.insert(item_id.clone(), sidecar);
+                    }
+                    if !cached {
+                        let status = self.review_ui.source_status.clone();
+                        self.set_status(status);
+                    } else if self.persist_staged_sidecar(&item_id) {
+                        self.set_status(format!(
+                            "Cached {} from {}; source provenance saved to sidecar",
+                            item.remote_id,
+                            item.site.as_str()
+                        ));
+                    } else {
+                        self.set_status(format!(
+                            "Cached {} from {}; no open sidecar was available for provenance",
+                            item.remote_id,
+                            item.site.as_str()
+                        ));
+                    }
+                } else {
+                    self.review_ui.source_busy = false;
+                    self.set_status(format!(
+                        "Source image for {item_id} was cached, but that image is no longer open"
+                    ));
+                }
+                ctx.request_repaint();
+            }
+            Err(TryRecvError::Empty) => self.source_rx = Some(rx),
+            Err(TryRecvError::Disconnected) => {
+                self.review_ui.source_busy = false;
+            }
+        }
+    }
+
+    /// Poll the at-most-one local vision worker. Results are staged as
+    /// suggestions; accepted or locked claims are protected by the store.
+    fn poll_local_vision(&mut self, ctx: &egui::Context) {
+        let Some(rx) = self.local_vision_rx.take() else { return };
+        match rx.try_recv() {
+            Ok(LocalVisionWorkerMsg::Suggestions { item_id, result }) => {
+                match result {
+                    Ok(suggestions) => {
+                        let (applied, rejected) =
+                            self.tag_review.stage_local_suggestions(&item_id, &suggestions);
+                        if applied > 0 {
+                            let evidence = self.build_filter_evidence(&self.tag_review);
+                            if let Some(gallery) = &mut self.gallery {
+                                gallery.filter_evidence = evidence;
+                            }
+                            self.set_status(format!(
+                                "Staged {applied} local suggestion(s) for review ({rejected} rejected)"
+                            ));
+                        } else {
+                            self.set_status(format!(
+                                "No new local suggestions ({rejected} rejected)"
+                            ));
+                        }
+                    }
+                    Err(error) => self.set_status(format!("Local suggestion failed: {error}")),
+                }
+                ctx.request_repaint();
+            }
+            Err(TryRecvError::Empty) => self.local_vision_rx = Some(rx),
+            Err(TryRecvError::Disconnected) => {}
+        }
+    }
+
+    fn poll_query_planner(&mut self) {
+        let Some(result) = self.query_planner.poll() else { return };
+        let Some(pending) = self.pending_ai_apply.take() else { return };
+        if pending.token != result.id {
+            self.pending_ai_apply = Some(pending);
+            return;
+        }
+        match result.query {
+            Ok(query) => {
+                self.tag_manager.ai_search.status =
+                    format!("Local model planned: {}", query);
+                self.apply_ai_query(pending.fallback, query, "local model");
+            }
+            Err(error) => {
+                let query = pending.fallback.query.clone();
+                self.tag_manager.ai_search.status =
+                    format!("Local model unavailable ({error}); used literal term: {query}");
+                self.apply_ai_query(pending.fallback, query, "literal fallback");
+            }
+        }
+    }
+
+    fn apply_ai_query(&mut self, apply: AiSearchApply, planned: crate::gallery::Query, source: &str) {
+        let evidence = self.build_filter_evidence(&self.tag_review);
+        let revision = self.tag_review.store.revision();
+        let final_query = if apply.mode == tag_manager::AiApplyMode::Add
+            && !matches!(planned, crate::gallery::Query::AlwaysTrue)
+        {
+            match &self.gallery {
+                Some(gallery) if !matches!(gallery.active_query, crate::gallery::Query::AlwaysTrue) => {
+                    crate::gallery::Query::And(vec![
+                        gallery.active_query.clone(),
+                        planned.clone(),
+                    ])
+                }
+                _ => planned.clone(),
+            }
+        } else {
+            planned.clone()
+        };
+        self.filter_query.filter = final_query.to_string();
+        self.filter_query.claim_scope = apply.scope;
+        self.filter_query.rating_min = None;
+        self.filter_query.confidence_min = apply.confidence.min;
+        self.filter_query.confidence_max = apply.confidence.max;
+        self.viewer_open = false;
+        if let Some(gallery) = &mut self.gallery {
+            gallery.active_query = final_query.clone();
+            gallery.filter_confidence = apply.confidence;
+            gallery.filter_scope = apply.scope;
+            gallery.filter_evidence = evidence;
+            gallery.filter_revision = revision;
+            gallery.query_error = None;
+            gallery.invalidate_filter_cache();
+        }
+        let verb = match apply.mode {
+            tag_manager::AiApplyMode::Rebuild => "rebuilt",
+            tag_manager::AiApplyMode::Add => "extended",
+        };
+        self.set_status(format!(
+            "AI query {verb} via {source}: {} → {} · {} claims",
+            apply.prompt, final_query, apply.scope
+        ));
+    }
+
     fn persist_state(&self) {
         let mut folder_views = self.folder_views.clone();
         let current = self.fm.current_dir.clone();
@@ -577,6 +1070,7 @@ impl SymtropyApp {
             view_mode: Some(match self.fm.view_mode {
                 ViewMode::List => "list".into(),
                 ViewMode::Gallery => "gallery".into(),
+                ViewMode::Masonry => "masonry".into(),
             }),
             sort: Some(sort_name(self.fm.sort).to_string()),
             sort_descending: Some(sort_direction_bool(self.fm.sort_direction)),
@@ -591,6 +1085,7 @@ impl SymtropyApp {
             button_scale: Some(self.theme.button_scale_setting()),
             recent_dirs: self.recent_dirs.clone(),
             folder_views,
+            onnx_vision: Some(self.review_ui.onnx.clone()),
         }
         .save();
     }
@@ -629,7 +1124,7 @@ impl SymtropyApp {
     /// memory and looked like a stale view when navigating back.
     fn rescan_gallery(&mut self, ctx: &egui::Context) {
         self.path_bar.invalidate_counts();
-        if self.fm.view_mode != ViewMode::Gallery {
+        if self.fm.view_mode == ViewMode::List {
             return;
         }
         let previous = self.gallery.take();
@@ -637,6 +1132,7 @@ impl SymtropyApp {
         if let Some(old) = previous {
             gallery.active_query = old.active_query;
             gallery.query_error = old.query_error;
+            gallery.set_filename_query(&old.filename_query);
             gallery.grid_scale = old.grid_scale;
             gallery.scroll_offset = old.scroll_offset;
             gallery.selected_images = old.selected_images;
@@ -645,6 +1141,7 @@ impl SymtropyApp {
             gallery.viewer_target = old.viewer_target;
             gallery.tag_search_query = old.tag_search_query;
         }
+        gallery.set_layout(gallery_layout(&self.fm.view_mode));
         gallery.set_sort(self.fm.sort, self.fm.sort_direction);
         self.gallery = Some(gallery);
     }
@@ -676,11 +1173,17 @@ impl SymtropyApp {
         self.remember_recent_dir(&path);
         self.path_bar.invalidate_counts();
         self.viewer_open = false;
-        self.slideshow = None;
         self.status = None;
         // Filters are per-view and deliberately never persisted or carried
-        // across folders, including the sidebar's typed expression.
+        // across folders, including the sidebar's typed expression and the
+        // toolbar's recursive filename search.
         self.filter_query = FilterQuery::default();
+        let had_filename_search = !self.fm.search_query.is_empty();
+        self.fm.search_query.clear();
+        self.fm.last_search_query.clear();
+        if had_filename_search {
+            self.fm.refresh();
+        }
 
         if let Some(view) = saved_view {
             if let Some(mode) = parse_view_mode(view.view_mode.as_deref()) {
@@ -702,12 +1205,13 @@ impl SymtropyApp {
         // Filters belong to the folder being viewed, never to the app. Copying
         // the outgoing query here made every path-bar jump inherit the previous
         // folder's filter, so the destination looked empty or "broken".
-        self.gallery = if self.fm.view_mode == ViewMode::Gallery {
+        self.gallery = if self.fm.view_mode.is_gallery() {
             let mut g = GalleryState::scan_dir(ctx, &self.fm.current_dir);
             if let Some(view) = saved_view {
                 if let Some(scale) = view.grid_scale { g.grid_scale = scale; }
                 if let Some(offset) = view.gallery_scroll_offset { g.scroll_offset = offset; }
             }
+            g.set_layout(gallery_layout(&self.fm.view_mode));
             g.set_sort(self.fm.sort, self.fm.sort_direction);
             Some(g)
         } else {
@@ -791,10 +1295,16 @@ impl SymtropyApp {
 
     fn sync_sidecar_into_gallery(&mut self, path: &Path, sc: &Sidecar) {
         if let Some(g) = &mut self.gallery {
-            if let Some(item) = g.items.iter_mut().find(|item| Path::new(&item.path) == path) {
+            let changed = if let Some(item) = g.items.iter_mut().find(|item| Path::new(&item.path) == path) {
                 item.sidecar = sc.clone();
-                item.tags = sc.tags.iter().cloned().collect();
+                item.tags = sc.active_tags().into_iter().collect();
                 item.rating = sc.rating;
+                true
+            } else {
+                false
+            };
+            if changed {
+                g.invalidate_filter_cache();
             }
         }
     }
@@ -819,6 +1329,31 @@ impl SymtropyApp {
             changed += 1;
         }
         self.set_status(format!("Set rating on {} image(s)", changed));
+    }
+
+    fn show_paths_in_gallery(&mut self, ctx: &egui::Context, paths: &[PathBuf]) {
+        let index_path = crate::gallery::workers::cache_dir().join("index.tsv");
+        let mut changed = 0;
+        for path in paths {
+            if path.is_dir() {
+                continue;
+            }
+            let mut sc = self.sidecar_for_path(path);
+            if !sc.is_display_suppressed() {
+                continue;
+            }
+            sc.properties.remove("display");
+            if sc.save(path).is_err() {
+                continue;
+            }
+            self.sync_sidecar_into_gallery(path, &sc);
+            crate::gallery::workers::update_index_entry(&index_path, &path.to_string_lossy(), &sc);
+            changed += 1;
+        }
+        if changed > 0 {
+            self.rescan_gallery(ctx);
+        }
+        self.set_status(format!("Restored {} image(s) to the gallery", changed));
     }
 
     fn apply_tag_for_paths(&mut self, paths: &[PathBuf], tag: &str, remove: bool) {
@@ -905,11 +1440,7 @@ impl SymtropyApp {
     fn refresh_filter_after_tag(&mut self, from: &str, to: Option<&str>) {
         let from_key = crate::gallery::hierarchy::tag_key(from);
         let to_key = to.map(crate::gallery::hierarchy::tag_key);
-        let rewritten = crate::sidebar::replace_filter_token(
-            &self.filter_query.filter,
-            &from_key,
-            to_key.as_deref(),
-        );
+        let rewritten = crate::sidebar::replace_filter_text(&self.filter_query.filter, from, to);
         if let Some(g) = &mut self.gallery {
             let from_key = from_key.clone();
             let to_key = to_key.clone();
@@ -921,13 +1452,17 @@ impl SymtropyApp {
                 }
             });
             g.query_error = None;
-            if crate::gallery::Query::parse(&rewritten).is_ok() {
+            g.invalidate_filter_cache();
+            let still_valid = crate::gallery::Query::parse(&rewritten).is_ok();
+            if still_valid {
                 self.filter_query.filter = rewritten;
             } else {
                 // Removing a tag can leave a dangling operator. The active
                 // query AST is still valid, so rebuild the text from it.
                 self.filter_query.filter = g.active_query.to_string();
                 self.filter_query.rating_min = None;
+                self.filter_query.claim_scope = ClaimScope::Curated;
+                g.filter_scope = ClaimScope::Curated;
             }
         } else {
             self.filter_query.filter = rewritten;
@@ -967,7 +1502,7 @@ impl SymtropyApp {
                         sc, &descendants, &tag, Some(&new_name), &old_chain, &old_chain,
                     )
                 });
-                if let Some(sc) = &mut self.staged_sidecar {
+                for sc in self.staged_sidecars.values_mut() {
                     remap_subtree_in_sidecar(
                         sc, &descendants, &tag, Some(&new_name), &old_chain, &old_chain,
                     );
@@ -1003,7 +1538,7 @@ impl SymtropyApp {
                         sc, &descendants, &tag, Some(&tag), &old_chain, &new_chain,
                     )
                 });
-                if let Some(sc) = &mut self.staged_sidecar {
+                for sc in self.staged_sidecars.values_mut() {
                     remap_subtree_in_sidecar(sc, &descendants, &tag, Some(&tag), &old_chain, &new_chain);
                 }
                 if let Some(g) = &mut self.gallery {
@@ -1037,7 +1572,7 @@ impl SymtropyApp {
                         sc, &descendants, &source, Some(&target), &old_chain, &new_chain,
                     )
                 });
-                if let Some(sc) = &mut self.staged_sidecar {
+                for sc in self.staged_sidecars.values_mut() {
                     remap_subtree_in_sidecar(
                         sc, &descendants, &source, Some(&target), &old_chain, &new_chain,
                     );
@@ -1070,7 +1605,7 @@ impl SymtropyApp {
                 let changed = self.rewrite_sidecars(|sc| {
                     remap_subtree_in_sidecar(sc, &descendants, &tag, None, &old_chain, &new_chain)
                 });
-                if let Some(sc) = &mut self.staged_sidecar {
+                for sc in self.staged_sidecars.values_mut() {
                     remap_subtree_in_sidecar(sc, &descendants, &tag, None, &old_chain, &new_chain);
                 }
                 self.refresh_filter_after_tag(&tag, None);
@@ -1145,6 +1680,7 @@ impl SymtropyApp {
         if let Some(g) = &mut self.gallery {
             g.items.retain(|item| !paths.iter().any(|p| p == Path::new(&item.path)));
             g.selected_images.retain(|s| !paths.iter().any(|p| p == Path::new(s)));
+            g.invalidate_filter_cache();
             let viewer_gone = g
                 .viewer_target
                 .as_ref()
@@ -1312,6 +1848,7 @@ impl SymtropyApp {
                 }
             }
             Action::SetRating { paths, rating } => self.set_rating_for_paths(&paths, rating),
+            Action::ShowInGallery(paths) => self.show_paths_in_gallery(ctx, &paths),
             Action::EditTag { paths, remove } => {
                 self.dialog = Some(Dialog::EditTag { paths, remove, text: String::new() });
             }
@@ -1324,14 +1861,22 @@ impl SymtropyApp {
                 match crate::gallery::Query::parse(&token) {
                     Ok(parsed) => {
                         self.filter_query.filter = token.clone();
+                        self.filter_query.claim_scope = ClaimScope::Curated;
                         self.filter_query.rating_min = None;
+                        let confidence = self.filter_query.confidence_range();
+                        let evidence = self.build_filter_evidence(&self.tag_review);
+                        let revision = self.tag_review.store.revision();
                         if let Some(g) = &mut self.gallery {
                             g.active_query = parsed;
+                            g.filter_confidence = confidence;
+                            g.filter_scope = ClaimScope::Curated;
+                            g.filter_revision = revision;
+                            g.filter_evidence = evidence;
                             g.query_error = None;
+                            g.invalidate_filter_cache();
                         }
                         self.viewer_open = false;
-                        self.slideshow = None;
-                        self.set_status(format!("Filter applied: {}", token));
+                                        self.set_status(format!("Filter applied: {}", token));
                     }
                     Err(error) => self.set_status(format!("Invalid filter: {}", error)),
                 }
@@ -1355,37 +1900,17 @@ impl SymtropyApp {
                     self.set_status(format!("Found {} duplicate file(s)", count));
                 }
             }
-            Action::ToggleSlideshow => {
-                if self.slideshow.is_some() {
-                    self.slideshow = None;
-                    self.set_status("Slideshow stopped");
-                } else {
-                    let mut paths = self.gallery.as_ref().map(|g| {
-                        let visible = g.visible_paths();
-                        let selected: Vec<String> = g.selected_images.iter()
-                            .filter(|p| visible.iter().any(|v| v == *p))
-                            .cloned()
-                            .collect();
-                        if selected.len() > 1 { selected } else { visible }
-                    }).unwrap_or_default();
-                    paths.retain(|p| !crate::gallery::workers::is_video_path(Path::new(p)));
-                    if paths.is_empty() {
-                        self.set_status("No images to show");
-                    } else {
-                        let interval = Duration::from_secs(3);
-                        self.viewer_open = true;
-                        if let Some(g) = &mut self.gallery {
-                            g.viewer_target = Some(paths[0].clone());
-                        }
-                        self.slideshow = Some(SlideshowState {
-                            paths,
-                            idx: 0,
-                            next_at: Instant::now() + interval,
-                            interval,
-                        });
-                        ctx.request_repaint_after(interval);
-                        self.set_status("Slideshow started — toggle again to stop");
-                    }
+            Action::OpenTagManager(target) => self.open_tag_manager(target),
+            Action::ToggleTagManager => self.toggle_tag_manager(),
+            Action::ExportMetadataIndex => {
+                let default_path = crate::paths::config_dir().join("symtropy-metadata-index.json");
+                self.dialog = Some(Dialog::ExportMetadata { path: default_path.to_string_lossy().into_owned() });
+            }
+            Action::ExportMetadataCommit { path } => {
+                let items = self.gallery.as_ref().map(|g| g.items.as_slice()).unwrap_or_default();
+                match crate::metadata_export::write_metadata_index(items, &path) {
+                    Ok(count) => self.set_status(format!("Exported metadata for {} item(s) to {}", count, path.display())),
+                    Err(error) => self.set_status(format!("Export failed: {error}")),
                 }
             }
             Action::CopyPath(p) => {
@@ -1401,7 +1926,7 @@ impl SymtropyApp {
                 self.fm.bookmarks.save();
             }
             Action::SelectAll => {
-                if self.fm.view_mode == ViewMode::Gallery {
+                if self.fm.view_mode.is_gallery() {
                     if let Some(g) = &mut self.gallery {
                         self.fm.selected = g.items.iter().map(|i| PathBuf::from(&i.path)).collect();
                         g.selected_images = g.items.iter().map(|i| i.path.clone()).collect();
@@ -1413,7 +1938,7 @@ impl SymtropyApp {
                 self.fm.selection_anchor = None;
             }
             Action::SelectInverse => {
-                if self.fm.view_mode == ViewMode::Gallery {
+                if self.fm.view_mode.is_gallery() {
                     if let Some(g) = &mut self.gallery {
                         let all: Vec<(PathBuf, String)> = g
                             .items
@@ -1459,6 +1984,12 @@ impl SymtropyApp {
             }
             Action::ClearFilters => {
                 self.filter_query = FilterQuery::default();
+                self.filter_query.claim_scope = ClaimScope::Curated;
+                if !self.fm.search_query.is_empty() {
+                    self.fm.search_query.clear();
+                    self.fm.last_search_query.clear();
+                    self.fm.refresh();
+                }
                 if let Some(g) = &mut self.gallery {
                     g.clear_filters();
                 }
@@ -1526,6 +2057,7 @@ impl SymtropyApp {
                 TagDialog::Delete { .. } => "Delete Tag",
             },
             Dialog::Duplicates { .. } => "Duplicate Files",
+            Dialog::ExportMetadata { .. } => "Export Metadata Index",
         };
         let mut close = false;
         let mut submit: Option<Action> = None;
@@ -1696,6 +2228,25 @@ impl SymtropyApp {
                             }
                         }
                     }
+                    Dialog::ExportMetadata { path } => {
+                        ui.label("Write tags, ratings, sources, relationships, and notes to a JSON file.");
+                        ui.label(egui::RichText::new("No image pixels or cached analysis are included.").size(11.0).color(egui::Color32::GRAY));
+                        let resp = ui.text_edit_singleline(path);
+                        ui.horizontal(|ui| {
+                            if ui.button("Export").clicked()
+                                || (resp.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter)))
+                            {
+                                if path.trim().is_empty() {
+                                    self.set_status("Choose an export path");
+                                } else {
+                                    submit = Some(Action::ExportMetadataCommit {
+                                        path: PathBuf::from(path.trim()),
+                                    });
+                                }
+                            }
+                            if ui.button("Cancel").clicked() { close = true; }
+                        });
+                    }
                     Dialog::Duplicates { groups } => {
                         ui.label(format!("{} groups of identical files", groups.len()));
                         egui::ScrollArea::vertical().max_height(360.0).show(ui, |ui| {
@@ -1736,17 +2287,15 @@ impl SymtropyApp {
 impl eframe::App for SymtropyApp {
     fn clear_color(&self, _visuals: &egui::Visuals) -> [f32; 4] { [0.0, 0.0, 0.0, 0.0] }
 
-    fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+    fn update(&mut self, ctx: &egui::Context, frame: &mut eframe::Frame) {
         let ppp = ctx.pixels_per_point();
         self.theme.sync_scale(ppp, ctx.screen_rect().size());
-        let fullscreen = ctx.input(|i| i.viewport().fullscreen.unwrap_or(false));
-        // In true fullscreen the WM ignores frame extents and the plate fills the viewport.
-        // Reporting an extent there used to disagree with the chrome geometry.
-        let overhang_px = if fullscreen {
-            0
-        } else {
-            (crate::window::overhang(&self.theme) * ppp).round() as u32
-        };
+        crate::wayland_drag::init_from_frame(frame);
+        crate::wayland_drag::tick(ctx);
+        self.poll_source_workers(ctx);
+        self.poll_local_vision(ctx);
+        self.poll_query_planner();
+        self.sync_recursive_tag_search();
 
         if ctx.input(|i| i.key_pressed(egui::Key::L) && i.modifiers.ctrl) {
             let dir = self.fm.current_dir.clone();
@@ -1756,19 +2305,6 @@ impl eframe::App for SymtropyApp {
         self.frames += 1;
         if self.frames == 1 {
             eprintln!("startup: first frame / window ready @ {}ms", crate::startup_ms());
-        }
-        if self.x11.is_none() && self.frames < 600 {
-            if self.frames % 10 == 0 {
-                if let Some(x) = X11Window::find() {
-                    eprintln!("X11: Found window! Applying frame extents.");
-                    x.set_frame_extents(overhang_px);
-                    self.last_overhang_px = overhang_px;
-                    self.x11 = Some(x);
-                } else if self.frames == 590 {
-                    eprintln!("X11: Gave up. Are you running native Wayland?");
-                }
-            }
-            ctx.request_repaint();
         }
 
         // Persist state on close
@@ -1781,31 +2317,26 @@ impl eframe::App for SymtropyApp {
         let status_text = self.status.clone();
 
         // OS-level drops are separate from egui's internal DragPayload. Import them as copies
-        // into the folder currently being viewed.
-        let dropped: Vec<PathBuf> = ctx.input(|i| {
+        // into the folder currently being viewed. winit handles this on X11; our Wayland
+        // data-device target covers native Wayland clients.
+        let mut dropped: Vec<PathBuf> = ctx.input(|i| {
             i.raw.dropped_files
                 .iter()
                 .filter_map(|file| file.path.clone())
                 .filter(|path| path.exists())
                 .collect()
         });
+        dropped.extend(crate::wayland_drag::take_incoming_drops());
+        dropped.retain(|path| path.exists());
         if !dropped.is_empty() {
             fm_actions.push(Action::ImportExternal { paths: dropped, dir: self.fm.current_dir.clone() });
-        }
-
-        // An external XDND target can request DELETE after accepting a plain
-        // (move) drag. The source thread reports those paths back here so the
-        // existing shared action path handles cleanup and status.
-        let external_moves = crate::drag_source::take_external_moves();
-        if !external_moves.is_empty() {
-            fm_actions.push(Action::Trash(external_moves));
         }
 
         // No-icon keyboard shortcuts. They stay out of the way of text fields, dialogs and the
         // viewer (which has its own key bindings in its own viewport).
         if self.dialog.is_none() && !self.viewer_open && ctx.memory(|m| m.focused()).is_none() {
             use egui::Key;
-            let (undo, redo, all, invert, clear, rating, back, forward) = ctx.input(|i| {
+            let (undo, redo, all, invert, clear, rating, back, forward, manager) = ctx.input(|i| {
                 let ctrl = i.modifiers.ctrl;
                 let alt = i.modifiers.alt;
                 let plain = !ctrl && !alt && !i.modifiers.shift;
@@ -1825,6 +2356,7 @@ impl eframe::App for SymtropyApp {
                     },
                     alt && !ctrl && i.key_pressed(Key::ArrowLeft),
                     alt && !ctrl && i.key_pressed(Key::ArrowRight),
+                    ctrl && i.key_pressed(Key::T),
                 )
             });
             if undo { fm_actions.push(Action::Undo); }
@@ -1834,6 +2366,7 @@ impl eframe::App for SymtropyApp {
             if clear { fm_actions.push(Action::ClearSelection); }
             if back { fm_actions.push(Action::NavigateBack); }
             if forward { fm_actions.push(Action::NavigateForward); }
+            if manager { fm_actions.push(Action::ToggleTagManager); }
             if let Some(rating) = rating {
                 let paths = self.selected_paths();
                 if !paths.is_empty() {
@@ -1842,6 +2375,7 @@ impl eframe::App for SymtropyApp {
             }
         }
 
+        let mut filename_search_switched_view = false;
         crate::window::show(ctx, &self.theme, "Symtropy", |ui| {
             let max_size = ui.available_size();
 
@@ -1855,43 +2389,117 @@ impl eframe::App for SymtropyApp {
                                                }
                                                ui.separator();
 
-                                               if ui.button("⬅").clicked() && self.fm.history_idx > 0 {
+                                               if ui.add_enabled(self.fm.history_idx > 0, egui::Button::new("⬅"))
+                                                   .on_hover_text("Back (Alt+←)")
+                                                   .clicked()
+                                               {
                                                    fm_actions.push(Action::NavigateBack);
                                                }
-                                               if ui.button("➡").clicked() && self.fm.history_idx + 1 < self.fm.history.len() {
+                                               if ui.add_enabled(self.fm.history_idx + 1 < self.fm.history.len(), egui::Button::new("➡"))
+                                                   .on_hover_text("Forward (Alt+→)")
+                                                   .clicked()
+                                               {
                                                    fm_actions.push(Action::NavigateForward);
                                                }
-                                               if ui.button("⬆").clicked() {
-                                                   if let Some(p) = self.fm.current_dir.parent().map(Path::to_path_buf) {
-                                                       fm_actions.push(Action::Navigate(p));
-                                                   }
+                                               let undo_hint = if self.undo_stack.is_empty() {
+                                                   "Nothing to undo yet (Ctrl+Z)"
+                                               } else {
+                                                   "Undo last file operation (Ctrl+Z)"
+                                               };
+                                               let redo_hint = if self.redo_stack.is_empty() {
+                                                   "Nothing to redo yet (Ctrl+Y)"
+                                               } else {
+                                                   "Redo last file operation (Ctrl+Y)"
+                                               };
+                                               if ui.add_enabled(!self.undo_stack.is_empty(), egui::Button::new("Undo"))
+                                                   .on_hover_text(undo_hint)
+                                                   .clicked()
+                                               {
+                                                   fm_actions.push(Action::Undo);
+                                               }
+                                               if ui.add_enabled(!self.redo_stack.is_empty(), egui::Button::new("Redo"))
+                                                   .on_hover_text(redo_hint)
+                                                   .clicked()
+                                               {
+                                                   fm_actions.push(Action::Redo);
                                                }
 
-                                               let resp = ui.add(egui::TextEdit::singleline(&mut self.fm.search_query).hint_text("Search...").desired_width(150.0));
-                                               if resp.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter)) { self.fm.search_recursive(); }
+                                               ui.label("Find files:");
+                                               let resp = ui.add(
+                                                   egui::TextEdit::singleline(&mut self.fm.search_query)
+                                                       .hint_text("filename…")
+                                                       .desired_width(180.0),
+                                               ).on_hover_text("Recursive filename search — not tag search");
+                                               if self.fm.search_query != self.fm.last_search_query {
+                                                   // The default view is the image gallery, which cannot show source
+                                                   // files. A generic filename search must land in the file list or
+                                                   // it looks like nothing happened (and the tag search gets the blame).
+                                                   if self.fm.last_search_query.is_empty()
+                                                       && !self.fm.search_query.is_empty()
+                                                       && self.fm.view_mode.is_gallery()
+                                                   {
+                                                       self.fm.view_mode = ViewMode::List;
+                                                       filename_search_switched_view = true;
+                                                   }
+                                                   self.fm.search_recursive();
+                                               }
+                                                if resp.lost_focus()
+                                                    || (resp.has_focus()
+                                                        && ui.input(|i| i.key_pressed(egui::Key::Enter)))
+                                                {
+                                                    self.fm.search_recursive();
+                                                }
+                                               if !self.fm.search_query.is_empty() {
+                                                   ui.label(format!("{} found", self.fm.entries.len()));
+                                                   if ui.small_button("✕").on_hover_text("Clear filename search").clicked() {
+                                                       self.fm.search_query.clear();
+                                                       self.fm.last_search_query.clear();
+                                                       self.fm.refresh();
+                                                   }
+                                               }
+                                               if let Some(gallery) = self.gallery.as_mut() {
+                                                   gallery.set_filename_query(&self.fm.search_query);
+                                               }
 
                                                ui.separator();
-                                               ui.selectable_value(&mut self.fm.view_mode, ViewMode::List, "☰ List");
-                                               if ui.selectable_value(&mut self.fm.view_mode, ViewMode::Gallery, "🖼️ Gallery").clicked() {
-                                                   if self.gallery.is_none() {
-                                                       self.gallery = Some(GalleryState::scan_dir(ui.ctx(), &self.fm.current_dir));
-                                                       if let Some(g) = self.gallery.as_mut() {
-                                                           g.set_sort(self.fm.sort, self.fm.sort_direction);
-                                                       }
+                                               // One Dolphin-style control cycles the three views.
+                                               // "Gallery" is the cheap uniform-row mode; "Masonry"
+                                               // keeps the old variable-height aspect mosaic.
+                                               let (current_label, target_mode) = match self.fm.view_mode {
+                                                   ViewMode::List => ("List", ViewMode::Gallery),
+                                                   ViewMode::Gallery => ("Gallery", ViewMode::Masonry),
+                                                   ViewMode::Masonry => ("Masonry", ViewMode::List),
+                                               };
+                                               let next_label = match target_mode {
+                                                   ViewMode::List => "List",
+                                                   ViewMode::Gallery => "Gallery",
+                                                   ViewMode::Masonry => "Masonry",
+                                               };
+                                               if ui.button(current_label).on_hover_text(
+                                                   format!("Current view: {current_label}. Click for {next_label}."),
+                                               ).clicked() {
+                                                   if target_mode.is_gallery() && self.gallery.is_none() {
+                                                       let mut gallery = GalleryState::scan_dir(ui.ctx(), &self.fm.current_dir);
+                                                       gallery.set_layout(gallery_layout(&target_mode));
+                                                       gallery.set_sort(self.fm.sort, self.fm.sort_direction);
+                                                       self.gallery = Some(gallery);
+                                                   } else if let Some(gallery) = self.gallery.as_mut() {
+                                                       gallery.set_layout(gallery_layout(&target_mode));
                                                    }
+                                                   self.fm.view_mode = target_mode;
                                                }
-                                               ui.checkbox(&mut self.fm.show_hidden, "Hidden");
-                                               if ui.button("＋ Folder").clicked() {
-                                                   fm_actions.push(Action::NewFolder(self.fm.current_dir.clone()));
-                                               }
-                                               if ui.button("⟳").clicked() {
-                                                   fm_actions.push(Action::Refresh);
-                                               }
-                                               if ui.button(if self.slideshow.is_some() { "⏹ Slideshow" } else { "▶ Slideshow" }).clicked() {
-                                                   fm_actions.push(Action::ToggleSlideshow);
-                                               }
-                                               if ui.button("Find Duplicates").clicked() {
-                                                   fm_actions.push(Action::FindDuplicates);
+
+                                               // Scope is directory-bound, so this stays visible
+                                               // instead of hiding inside a menu with the filters.
+                                               let recursive_label = if self.recursive_tag_search {
+                                                   "Recursive tags: On"
+                                               } else {
+                                                   "Recursive tags: Off"
+                                               };
+                                               if ui.button(recursive_label).on_hover_text(
+                                                   "Tag filters: current folder only, or this folder and all subfolders",
+                                               ).clicked() {
+                                                   self.recursive_tag_search = !self.recursive_tag_search;
                                                }
                                            });
                                            ui.separator();
@@ -2101,7 +2709,8 @@ impl eframe::App for SymtropyApp {
                                                                                       sort_descending: sort_direction_bool(self.fm.sort_direction),
                                                                                       can_paste: !self.clipboard.is_empty(),
                                                                                   };
-                                                                                  gallery.show(ui, &self.fm.current_dir, self.viewer_open, self.dialog.is_some(), options, &mut fm_actions);
+                                                                                  let viewport = ui.available_rect_before_wrap().intersect(ui.clip_rect());
+                                                                                   gallery.show(ui, &self.theme, viewport, &self.fm.current_dir, self.viewer_open, self.dialog.is_some(), options, &mut fm_actions);
 
                                                                                   if gallery.request_open_viewer {
                                                                                       self.viewer_open = true;
@@ -2123,6 +2732,10 @@ impl eframe::App for SymtropyApp {
                                        }
             );
         });
+
+        if filename_search_switched_view {
+            self.set_status("Filename search results are shown in List view");
+        }
 
         // The chrome sliders live in the theme gutter outside the content area, so persist them
         // as soon as they move.
@@ -2149,31 +2762,64 @@ impl eframe::App for SymtropyApp {
             self.apply_action(ctx, action);
         }
 
-        if let Some(x) = &self.x11 {
-            if overhang_px != self.last_overhang_px {
-                x.set_frame_extents(overhang_px);
-                self.last_overhang_px = overhang_px;
-                // Frame extents are applied asynchronously by the WM.
-                ctx.request_repaint();
+        if self.tag_manager.open {
+            let review_item = self.tag_manager.item.clone().unwrap_or_default();
+            let mut active_item = review_item.clone();
+            let mut staged_sidecar = if review_item.is_empty() {
+                None
+            } else {
+                self.take_staged_sidecar(&review_item)
+            };
+            let manager_tag_tree = self.gallery.as_ref().map(|g| g.tag_tree.clone()).unwrap_or_else(|| {
+                crate::gallery::TagNode { name: "Root".into(), children: Vec::new() }
+            });
+            let gallery_query = self
+                .gallery
+                .as_ref()
+                .map(|g| g.active_query.clone())
+                .unwrap_or(crate::gallery::Query::AlwaysTrue);
+            let outcome = tag_manager::show(
+                ctx,
+                &mut self.tag_manager,
+                &mut self.tag_review,
+                &mut self.review_ui,
+                &mut staged_sidecar,
+                &manager_tag_tree,
+                &gallery_query,
+            );
+            // Apply writes for the item that was visible while the window was
+            // drawn, before a target change swaps the staged sidecar.
+            let outcome_sidecar = staged_sidecar.clone();
+            if let Some(target) = outcome.target_changed.clone() {
+                if let Some(sc) = staged_sidecar.take() {
+                    self.staged_sidecars.insert(active_item.clone(), sc);
+                }
+                active_item = target.clone();
+                staged_sidecar = self.take_staged_sidecar(&target);
+                self.tag_manager.item = Some(target.clone());
             }
-        }
-
-        // Give the WM a short startup window to apply those extents even when
-        // an empty folder would otherwise stop repainting immediately.
-        if self.frames < 120 {
-            ctx.request_repaint();
-        }
-
-        if self.viewer_open {
-            if let Some(slideshow) = &mut self.slideshow {
-                if !slideshow.paths.is_empty() && Instant::now() >= slideshow.next_at {
-                    slideshow.idx = (slideshow.idx + 1) % slideshow.paths.len();
-                    let next = slideshow.paths[slideshow.idx].clone();
-                    if let Some(gallery) = &mut self.gallery {
-                        gallery.viewer_target = Some(next);
-                    }
-                    slideshow.next_at = Instant::now() + slideshow.interval;
-                    ctx.request_repaint_after(slideshow.interval);
+            if !active_item.is_empty() {
+                if let Some(sc) = staged_sidecar {
+                    self.staged_sidecars.insert(active_item, sc);
+                }
+            }
+            self.apply_review_outcome(ctx, &review_item, outcome.review, outcome_sidecar);
+            if outcome.find_duplicates {
+                self.apply_action(ctx, Action::FindDuplicates);
+            }
+            if let Some(apply) = outcome.ai_apply {
+                if self.pending_ai_apply.is_some() || self.query_planner.busy() {
+                    self.tag_manager.ai_search.status = "Local model is still planning…".to_string();
+                    self.set_status("Local model is still planning the previous query");
+                } else {
+                    let mut catalog = crate::sidebar::tag_catalog(&manager_tag_tree);
+                    catalog.extend(crate::query_composer::builtin_tag_ids());
+                    let mut seen = HashSet::new();
+                    catalog.retain(|tag| seen.insert(crate::gallery::hierarchy::tag_key(tag)));
+                    let token = self.query_planner.request(apply.prompt.clone(), catalog);
+                    self.pending_ai_apply = Some(PendingAiApply { token, fallback: apply });
+                    self.tag_manager.ai_search.status = "Planning locally with known tags…".to_string();
+                    self.set_status("Planning AI query with the local model");
                 }
             }
         }
@@ -2199,13 +2845,27 @@ impl eframe::App for SymtropyApp {
                 self.viewer_needs_fit = true;
                 self.viewer_last_fit_size = None;
 
-                if let Some(gallery) = &self.gallery {
-                    self.staged_sidecar = gallery.items.iter().find(|i| i.path == path).map(|i| i.sidecar.clone());
-                }
-
                 let is_video = crate::gallery::workers::is_video_path(Path::new(&path));
 
                 if !is_video {
+                    if path.to_lowercase().ends_with(".ssvg") {
+                        if let Ok(file) = std::fs::File::open(&path) {
+                            if let Ok((_, _, merged)) = ssvg::Package::read_baked_from(file) {
+                                if let Ok(img) = image::load_from_memory(&merged) {
+                                    let img = img.to_rgba8();
+                                    let size = [img.width() as usize, img.height() as usize];
+                                    let pixels = img.as_flat_samples();
+                                    let texture = ctx.load_texture(
+                                        format!("{path}_ssvg_merged"),
+                                        egui::ColorImage::from_rgba_unmultiplied(size, pixels.as_slice()),
+                                        egui::TextureOptions::LINEAR,
+                                    );
+                                    self.viewer_cache.insert(path.clone(), Some(texture));
+                                }
+                            }
+                        }
+                    }
+
                     if path.to_lowercase().ends_with(".webp") {
                         if let Ok(bytes) = std::fs::read(&path) {
                             if let Ok(decoder) = webp_animation::Decoder::new(&bytes) {
@@ -2271,8 +2931,13 @@ impl eframe::App for SymtropyApp {
             let restore_video = self.video_memory.get(&path).cloned();
 
             let mut is_edit_mode = self.is_edit_mode;
-            let mut staged_sidecar = self.staged_sidecar.take();
+            let mut staged_sidecar = self.take_staged_sidecar(&path);
             let mut filter_query = self.filter_query.clone();
+            let show_preserved_before = self
+                .gallery
+                .as_ref()
+                .is_some_and(|gallery| gallery.show_preserved_tags);
+            let mut show_preserved = show_preserved_before;
 
             let mut active_query = self.gallery.as_ref()
             .map(|g| g.active_query.clone())
@@ -2287,9 +2952,28 @@ impl eframe::App for SymtropyApp {
 
             let mut apply_clicked = false;
             let mut revert_clicked = false;
+            let mut applied_confidence: Option<ConfidenceRange> = None;
+            let mut applied_scope: Option<ClaimScope> = None;
             let mut viewer_actions: Vec<Action> = Vec::new();
             let short_name = path.rsplit('/').next().unwrap_or("").to_string();
             let is_video = crate::gallery::workers::is_video_path(Path::new(&path));
+            let scope_name = self
+                .fm
+                .current_dir
+                .file_name()
+                .map(|name| name.to_string_lossy().to_string())
+                .unwrap_or_else(|| self.fm.current_dir.display().to_string());
+            let filter_scope = self.gallery.as_ref().map_or_else(
+                || format!("{} (no gallery)", scope_name),
+                |gallery| format!(
+                    "{} ({}/{} shown{}, claims {})",
+                    scope_name,
+                    gallery.filtered_cache.len(),
+                    gallery.items.len(),
+                    if gallery.recursive_tag_search { ", recursive" } else { "" },
+                    gallery.filter_scope
+                ),
+            );
 
             ctx.show_viewport_immediate(
                 egui::ViewportId::from_hash_of("media_viewer"),
@@ -2301,6 +2985,7 @@ impl eframe::App for SymtropyApp {
                                         |ctx, _class| {
                                             if ctx.input(|i| i.key_pressed(egui::Key::Escape)) { still_open = false; }
                                             if ctx.input(|i| i.key_pressed(egui::Key::Tab)) { show_sidebar = !show_sidebar; }
+                                            let drag_suppressed = crate::wayland_drag::is_active();
 
                                             egui::CentralPanel::default().frame(egui::Frame::none()).show(ctx, |ui| {
                                                 let rect = ui.max_rect();
@@ -2325,7 +3010,7 @@ impl eframe::App for SymtropyApp {
                                                     let drag_bar_rect = egui::Rect::from_min_size(egui::pos2(sidebar_rect.min.x - 6.0, sidebar_rect.min.y), egui::vec2(6.0, sidebar_rect.height()));
                                                     let dr = ui.interact(drag_bar_rect, ui.id().with("sidebar_drag"), egui::Sense::drag());
                                                     if dr.hovered() || dr.dragged() { ctx.set_cursor_icon(egui::CursorIcon::ResizeHorizontal); }
-                                                    if dr.dragged() { sidebar_width = (sidebar_width - dr.drag_delta().x).clamp(400.0, rect.width() - 400.0); }
+                                                    if dr.dragged() && !drag_suppressed { sidebar_width = (sidebar_width - dr.drag_delta().x).clamp(400.0, rect.width() - 400.0); }
                                                     drag_resp_opt = Some(dr);
                                                 }
 
@@ -2349,7 +3034,7 @@ impl eframe::App for SymtropyApp {
 
                                                 let over_ui = close_hovered || toggle_hovered || controls.hovered
                                                     || drag_resp_opt.as_ref().map_or(false, |r| r.hovered() || r.dragged());
-                                                let bg_drag = bg_resp.dragged_by(egui::PointerButton::Primary);
+                                                let bg_drag = !drag_suppressed && bg_resp.dragged_by(egui::PointerButton::Primary);
                                                 let bg_drag_delta = bg_resp.drag_delta();
                                                 let bg_double_clicked = bg_resp.double_clicked();
 
@@ -2543,8 +3228,10 @@ impl eframe::App for SymtropyApp {
                                                         &mut filter_query,
                                                         &tag_tree,
                                                         &mut search_query,
+                                                        &mut show_preserved,
                                                         Some(Path::new(&path)),
                                                         query_error.as_deref(),
+                                                        &filter_scope,
                                                         &mut viewer_actions,
                                                     );
                                                     if apply { apply_clicked = true; }
@@ -2555,6 +3242,33 @@ impl eframe::App for SymtropyApp {
                                             if ctx.input(|i| i.viewport().close_requested()) { still_open = false; }
                                         },
             );
+
+            // Tag search is live, like the file-name search box. Applying the
+            // filter only confirms the result and closes the viewer; it is not
+            // required for the gallery to update.
+            if !is_edit_mode && filter_query.claim_scope == ClaimScope::Curated {
+                // AI-prompt filters are owned by Tag Manager. The curated
+                // sidebar must not silently replace an applied machine query.
+                let preview = filter_query.clone();
+                match preview.compile_for_apply(&tag_tree) {
+                    Ok(query) => {
+                        let confidence = preview.confidence_range();
+                        let scope = preview.claim_scope;
+                        if query != active_query {
+                            active_query = query;
+                            applied_confidence = Some(confidence);
+                            applied_scope = Some(scope);
+                            query_error = None;
+                        } else if !applied_confidence.is_some_and(|range| range == confidence)
+                            || !applied_scope.is_some_and(|value| value == scope)
+                        {
+                            applied_confidence = Some(confidence);
+                            applied_scope = Some(scope);
+                        }
+                    }
+                    Err(error) => query_error = Some(error),
+                }
+            }
 
             let mut state_changed = apply_clicked || revert_clicked;
 
@@ -2567,7 +3281,7 @@ impl eframe::App for SymtropyApp {
                             if let Some(g) = &mut self.gallery {
                                 if let Some(item) = g.items.iter_mut().find(|i| i.path == p) {
                                     item.sidecar = sc.clone();
-                                    item.tags = sc.tags.iter().cloned().collect();
+                                    item.tags = sc.active_tags().into_iter().collect();
                                     item.rating = sc.rating;
                                     let _ = item.sidecar.save(Path::new(&item.path));
 
@@ -2585,19 +3299,20 @@ impl eframe::App for SymtropyApp {
                         }
                     }
                 } else {
-                    // One filter field. Rating is just another term in the same expression.
-                    let tags = filter_query.filter.trim();
-                    let expression = match (tags.is_empty(), filter_query.rating_min) {
-                        (true, None) => String::new(),
-                        (true, Some(min)) => format!("rating:{}+", min),
-                        (false, None) => tags.to_string(),
-                        (false, Some(min)) => format!("({}) + rating:{}+", tags, min),
-                    };
-                    match crate::gallery::Query::parse(&expression) {
+                    // Prompt and exact filters compile to the same AST. The
+                    // rating control is folded in by FilterQuery::compile.
+                    match filter_query.compile_for_apply(&tag_tree) {
                         Ok(parsed) => {
                             active_query = parsed;
+                            applied_confidence = Some(filter_query.confidence_range());
+                            applied_scope = Some(filter_query.claim_scope);
                             query_error = None;
-                            self.set_status("Filter applied");
+                            self.set_status(format!(
+                                "Filter applied: {} · {} confidence · {} claims",
+                                active_query,
+                                filter_query.confidence_range(),
+                                filter_query.claim_scope
+                            ));
                             // Show the filtered gallery instead of leaving the viewer on top.
                             still_open = false;
                         }
@@ -2620,6 +3335,8 @@ impl eframe::App for SymtropyApp {
                 } else {
                     filter_query = FilterQuery::default();
                     active_query = crate::gallery::Query::AlwaysTrue;
+                    applied_confidence = Some(ConfidenceRange::accepted_only());
+                    applied_scope = Some(ClaimScope::Curated);
                     query_error = None;
                     self.set_status("Filters cleared");
                 }
@@ -2636,7 +3353,9 @@ impl eframe::App for SymtropyApp {
             self.viewer_show_sidebar = show_sidebar;
             self.viewer_sidebar_width = sidebar_width;
             self.is_edit_mode = is_edit_mode;
-            self.staged_sidecar = staged_sidecar;
+            if let Some(sc) = staged_sidecar {
+                self.staged_sidecars.insert(path.clone(), sc);
+            }
             self.filter_query = filter_query;
             let video_settings_changed = self.video_volume != video_volume
                 || self.video_muted != video_muted
@@ -2645,8 +3364,25 @@ impl eframe::App for SymtropyApp {
             self.video_muted = video_muted;
             self.video_loop = video_loop;
             if let Some(g) = &mut self.gallery {
+                if g.show_preserved_tags != show_preserved {
+                    g.show_preserved_tags = show_preserved;
+                    g.rebuild_tag_tree();
+                }
                 g.tag_search_query = search_query;
+                let confidence_changed =
+                    applied_confidence.is_some_and(|confidence| g.filter_confidence != confidence);
+                let scope_changed =
+                    applied_scope.is_some_and(|scope| g.filter_scope != scope);
+                if g.active_query != active_query || confidence_changed || scope_changed {
+                    g.invalidate_filter_cache();
+                }
                 g.active_query = active_query;
+                if let Some(confidence) = applied_confidence {
+                    g.filter_confidence = confidence;
+                }
+                if let Some(scope) = applied_scope {
+                    g.filter_scope = scope;
+                }
                 g.query_error = query_error;
             }
 
@@ -2671,8 +3407,7 @@ impl eframe::App for SymtropyApp {
                 self.remember_current_video();
                 self.save_video_state();
                 self.viewer_open = false;
-                self.slideshow = None;
-                self.viewer_loaded_path = None;
+                        self.viewer_loaded_path = None;
                 if let Some(g) = &mut self.gallery { g.viewer_target = None; g.selected_images.clear(); }
                 self.viewer_cache.clear();
                 self.viewer_player = None;
@@ -2681,6 +3416,8 @@ impl eframe::App for SymtropyApp {
                 self.save_video_state();
             }
         }
+
+        self.sync_tag_revision_to_gallery();
     }
 }
 
@@ -3138,6 +3875,26 @@ mod tests {
     }
 
     #[test]
+    fn staged_sidecars_are_isolated_by_full_path() {
+        let mut staged = StagedSidecars::default();
+        let mut first = Sidecar::default();
+        first.tags.push("first-image-tag".to_string());
+        let mut second = Sidecar::default();
+        second.tags.push("second-image-tag".to_string());
+
+        staged.insert("/library/first.jpg", first);
+        staged.insert("/library/second.jpg", second);
+
+        let first_out = staged.take("/library/first.jpg").unwrap();
+        assert_eq!(first_out.tags, ["first-image-tag"]);
+        assert_eq!(
+            staged.get("/library/second.jpg").unwrap().tags,
+            ["second-image-tag"]
+        );
+        assert!(staged.get("/library/first.jpg").is_none());
+    }
+
+    #[test]
     fn saved_state_tolerates_missing_new_fields() {
         let saved: SavedState = serde_json::from_str(r#"{"current_dir":"/tmp"}"#).unwrap();
         assert_eq!(saved.current_dir, Some(PathBuf::from("/tmp")));
@@ -3211,5 +3968,18 @@ mod tests {
         let json = serde_json::to_string(&saved).unwrap();
         assert!(!json.contains("query_history"));
         assert!(!json.contains("filter_presets"));
+    }
+
+    #[test]
+    fn saved_state_keeps_explicit_onnx_paths() {
+        let legacy = r#"{"onnx_vision":{"runtime_path":"/opt/onnx/libonnxruntime.so","model_path":"/models/clip.onnx","labels_path":"/models/labels.txt"}}"#;
+        let saved: SavedState = serde_json::from_str(legacy).unwrap();
+        let config = saved.onnx_vision.unwrap();
+
+        assert_eq!(config.runtime_path, "/opt/onnx/libonnxruntime.so");
+        assert_eq!(config.model_path, "/models/clip.onnx");
+        assert_eq!(config.labels_path, "/models/labels.txt");
+        assert_eq!(config.input_name, "input");
+        assert_eq!(config.top_k, 5);
     }
 }
